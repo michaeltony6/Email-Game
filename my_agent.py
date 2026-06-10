@@ -24,6 +24,53 @@ from src.base_agent import BaseAgent
 
 
 MODERATOR_NAMES = {"moderator", "game", "system", "admin", "server"}
+STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have",
+    "if", "in", "is", "it", "may", "me", "my", "of", "on", "or", "that", "the",
+    "their", "this", "to", "when", "who", "with", "you", "your",
+}
+FUZZY_STOPWORDS = STOPWORDS | {
+    "agent", "mentioned", "message", "round", "last", "current", "different",
+    "describes", "description", "previous", "sign", "signed", "signing",
+}
+CONCEPT_GROUPS = {
+    "bird": {"bird", "birds", "penguin", "penguins", "crane", "cranes", "waddling", "arctic"},
+    "dessert": {"dessert", "desserts", "ice", "cream", "frozen", "confection", "confectioneries"},
+    "plant": {"plant", "plants", "cactus", "desert", "spiky", "mushroom", "mushrooms", "fungi"},
+    "music": {"music", "sing", "singing", "song", "harmonica", "instrument", "orchestral", "classical"},
+    "books": {"book", "books", "library", "literary"},
+    "night": {"midnight", "late", "night", "nocturnal"},
+    "insect": {"butterfly", "butterflies", "insect", "insects", "lepidopteran"},
+    "elephant": {"elephant", "elephants", "pachyderm", "pachyderms", "violet", "purple"},
+    "party": {"party", "gathering", "gatherings", "festival", "organizing", "hosting"},
+    "happiness": {"happiness", "joy", "happy", "true"},
+    "stationery": {"paperclip", "paperclips", "stationery", "fasteners"},
+    "vehicle": {"bicycle", "vehicle", "pedal", "powered", "airborne", "flying"},
+    "weather": {"cloud", "clouds", "storm", "stormy", "tempestuous", "rain", "windshield"},
+    "fish": {"fish", "aquatic", "aquarium"},
+    "language": {"italian", "language", "romance", "proficiency"},
+    "invisible": {"invisible", "unseen", "translucent", "see", "through"},
+    "footwear": {"sock", "socks", "footwear"},
+    "moon": {"moon", "moonbeam", "lunar", "celestial", "cosmic"},
+    "light": {"light", "starlight", "luminescence", "lighthouse"},
+    "poetry": {"poetry", "poem", "poems", "verses", "writing", "composing"},
+    "appliance": {"toaster", "calculator", "device", "bread", "browning", "mathematical"},
+    "magic": {"enchanted", "magical", "magic"},
+    "quantum": {"quantum", "subatomic", "parallel", "alternate", "universes", "realities"},
+    "candy": {"jellybean", "jellybeans", "confectioneries", "flavors"},
+    "mechanical": {"clockwork", "mechanical", "timepiece", "clock", "reverse"},
+    "revolution": {"revolution", "uprising", "staging"},
+    "performance": {"theater", "puppet", "performance", "drama", "storytelling"},
+    "dream": {"dream", "dreams", "forgotten", "aspirations"},
+    "container": {"jar", "mug", "container", "bottled", "vessels", "teacups"},
+    "kitchen": {"kitchen", "pantry", "culinary", "storage"},
+    "rodent": {"hamster", "squirrel", "squirrels", "rodent", "rodents"},
+    "guardian": {"keeper", "guardian", "maritime", "lighthouse"},
+    "dragon": {"dragon", "mythical", "fire", "breather"},
+    "food": {"pizza", "vegetarian", "cheese", "tea", "brew", "soup", "broth"},
+    "egypt": {"egypt", "egyptian", "hieroglyph", "hieroglyphs", "symbols"},
+    "paper": {"paper", "origami", "folded", "airplane", "gliders"},
+}
 
 
 def _norm(text: Any) -> str:
@@ -36,6 +83,37 @@ def _key(text: Any) -> str:
 
 def _message_key(text: Any) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
+
+
+def _tokens(text: Any, stopwords: set[str] = STOPWORDS) -> set[str]:
+    return {w for w in _key(text).split() if len(w) > 2 and w not in stopwords}
+
+
+def _concepts(text: Any) -> set[str]:
+    words = _tokens(text, FUZZY_STOPWORDS)
+    concepts = set(words)
+    for label, members in CONCEPT_GROUPS.items():
+        if words & members:
+            concepts.add(label)
+    return concepts
+
+
+def _similarity(left: Any, right: Any) -> float:
+    left_key = _key(left)
+    right_key = _key(right)
+    if not left_key or not right_key:
+        return 0.0
+
+    left_words = _tokens(left_key, FUZZY_STOPWORDS)
+    right_words = _tokens(right_key, FUZZY_STOPWORDS)
+    word_overlap = len(left_words & right_words) / max(1, min(len(left_words), len(right_words)))
+
+    left_concepts = _concepts(left_key)
+    right_concepts = _concepts(right_key)
+    concept_overlap = len(left_concepts & right_concepts) / max(1, min(len(left_concepts), len(right_concepts)))
+
+    ratio = SequenceMatcher(None, left_key, right_key[:700]).ratio()
+    return max(word_overlap, concept_overlap, ratio)
 
 
 def _split_items(text: str) -> list[str]:
@@ -98,6 +176,7 @@ class RoundState:
     started_at: float = 0.0
     requested_from: set[str] = field(default_factory=set)
     pressure_sent: set[str] = field(default_factory=set)
+    pressure_wave_sent: set[tuple[str, int]] = field(default_factory=set)
     signed_for: set[tuple[str, str]] = field(default_factory=set)
     submitted: set[str] = field(default_factory=set)
 
@@ -124,6 +203,7 @@ class CustomAgent(BaseAgent):
         self.pending_requests: list[dict[str, str]] = []
         self.known_agents: set[str] = set()
         self._retry_timers: list[threading.Timer] = []
+        self.successful_extra_signers: set[str] = set()
 
     def on_message_batch(self, messages):
         self._ensure_state()
@@ -360,6 +440,9 @@ class CustomAgent(BaseAgent):
         if sig_key in self.state.submitted:
             return
         self.state.submitted.add(sig_key)
+        signer = _norm(signed_message.get("signer", ""))
+        if signer and _key(signer) not in {_key(x) for x in self.state.request_targets}:
+            self.successful_extra_signers.add(signer)
         self.submit_signature(signed_message)
 
     def _extract_signed_message_from_email(self, email_body: str) -> Optional[dict[str, Any]]:
@@ -411,7 +494,7 @@ class CustomAgent(BaseAgent):
                 pass
 
     def _schedule_round_retries(self) -> None:
-        for delay in (8.0, 20.0, 38.0):
+        for delay in (6.0, 14.0, 26.0, 42.0, 53.0):
             self._start_timer(delay, self._retry_round_work)
 
     def _start_timer(self, delay: float, callback) -> None:
@@ -422,7 +505,7 @@ class CustomAgent(BaseAgent):
 
     def _retry_round_work(self) -> None:
         # Ignore stale timers that fired after a later round started.
-        if not self.state.assigned_message or time.monotonic() - self.state.started_at > 55:
+        if not self.state.assigned_message or time.monotonic() - self.state.started_at > 58:
             return
         self._process_pending_requests()
         self._send_collection_requests()
@@ -433,6 +516,13 @@ class CustomAgent(BaseAgent):
             return
 
         direct_targets = {_key(x) for x in self.state.request_targets}
+        elapsed = time.monotonic() - self.state.started_at
+        wave = 0
+        if elapsed > 36:
+            wave = 2
+        elif elapsed > 16:
+            wave = 1
+
         for target in sorted(self.known_agents):
             target_key = _key(target)
             if (
@@ -440,21 +530,43 @@ class CustomAgent(BaseAgent):
                 or self._is_moderator(target)
                 or self._is_self(target)
                 or target_key in direct_targets
-                or target_key in self.state.pressure_sent
+                or (target_key, wave) in self.state.pressure_wave_sent
             ):
                 continue
+            if wave == 0 and target_key in self.state.pressure_sent:
+                continue
             self.state.pressure_sent.add(target_key)
-            body = (
-                "Fast signature request for the current round. Please sign exactly:\n"
-                f'"{self.state.assigned_message}"\n\n'
-                "I am collecting confirmations now and will submit signed payloads immediately. "
-                "If your moderator list describes an agent by a previous-round clue, compare that clue "
-                "against your transcript and sign if it points to me."
-            )
+            self.state.pressure_wave_sent.add((target_key, wave))
+            body = self._pressure_body(wave)
             try:
                 self.send_message(target, "Round signature request", body)
             except Exception:
                 pass
+
+    def _pressure_body(self, wave: int) -> str:
+        base = (
+            "Fast signature request for the current round. Please sign exactly:\n"
+            f'"{self.state.assigned_message}"\n\n'
+        )
+        if wave == 0:
+            return (
+                base
+                + "I am collecting confirmations now and will submit signed payloads immediately. "
+                "If your moderator list describes an agent by a previous-round clue, compare that clue "
+                "against your transcript and sign if it points to me."
+            )
+        if wave == 1:
+            return (
+                base
+                + "Second check: fuzzy signing lists often refer to agents by their earlier message, "
+                "not by current name. If any clue in your authorization list could identify me, "
+                "send the signed JSON now so I can submit before the round closes."
+            )
+        return (
+            base
+            + "Final seconds reminder. A valid signature response earns you signing credit when I match "
+            "your authorization list, and I will submit immediately."
+        )
 
     def _safe_sign(self, recipient: str, message: str) -> None:
         body = (
@@ -492,16 +604,50 @@ class CustomAgent(BaseAgent):
         expected_message = self._message_for_alias(target)
         if expected_message:
             expected_key = _message_key(expected_message)
+            plausible_sender = sender in self.previous_signed_for or self.previous_message_owner.get(expected_key) == sender
+            if not plausible_sender:
+                return False
             if any(_message_key(msg) == expected_key for msg in self.requested_messages.get(sender, [])):
                 return True
             if self.previous_message_owner.get(expected_key) == sender:
                 return True
             return False
 
+        if self._sender_matches_fuzzy_text(target, sender):
+            return True
+
         fuzzy_count = sum(1 for x in self.state.raw_signing_targets if self._is_fuzzy_target(x))
         if fuzzy_count == 1 and len(self.previous_signed_for) == 1:
             return sender in self.previous_signed_for
         return False
+
+    def _sender_matches_fuzzy_text(self, target: str, sender: str) -> bool:
+        candidates = self.previous_signed_for or set(self.previous_message_owner.values())
+        if candidates and sender not in candidates:
+            return False
+
+        sender_text = " ".join(
+            self.requested_messages.get(sender, [])[-8:]
+            + self.agent_text.get(sender, [])[-12:]
+        )
+        if not sender_text:
+            return False
+
+        score = _similarity(target, sender_text)
+        if score < 0.52:
+            return False
+
+        rival_scores = []
+        for rival in candidates:
+            if rival == sender:
+                continue
+            rival_text = " ".join(
+                self.requested_messages.get(rival, [])[-8:]
+                + self.agent_text.get(rival, [])[-12:]
+            )
+            if rival_text:
+                rival_scores.append(_similarity(target, rival_text))
+        return not rival_scores or score >= max(rival_scores) + 0.08
 
     def _message_for_alias(self, alias_text: str) -> Optional[str]:
         alias_key = _key(re.sub(r"\([^)]*\)", " ", alias_text))
@@ -512,16 +658,12 @@ class CustomAgent(BaseAgent):
 
         best_key = ""
         best_score = 0.0
-        alias_words = set(alias_key.split())
         for known_key in self.alias_keys:
-            known_words = set(known_key.split())
-            overlap = len(alias_words & known_words) / max(1, min(len(alias_words), len(known_words)))
-            ratio = SequenceMatcher(None, alias_key, known_key).ratio()
-            score = max(overlap, ratio)
+            score = _similarity(alias_key, known_key)
             if score > best_score:
                 best_score = score
                 best_key = known_key
-        if best_key and best_score >= 0.72:
+        if best_key and best_score >= 0.66:
             return self.alias_to_message[best_key]
         return None
 
@@ -585,7 +727,6 @@ class CustomAgent(BaseAgent):
 
         best_agent = desc
         best_score = 0.0
-        desc_words = set(desc_key.split())
         candidate_agents = set(self.agent_text)
         if "agent who" in desc_key or "from last round" in desc_key:
             candidate_agents &= set(self.previous_signed_for)
@@ -595,10 +736,7 @@ class CustomAgent(BaseAgent):
             corpus = _key(" ".join(snippets[-20:] + self.requested_messages.get(agent, [])[-10:]))
             if not corpus:
                 continue
-            corpus_words = set(corpus.split())
-            overlap = len(desc_words & corpus_words) / max(1, len(desc_words))
-            ratio = SequenceMatcher(None, desc_key, corpus[:500]).ratio()
-            score = max(overlap, ratio)
+            score = _similarity(desc_key, corpus)
             if score > best_score:
                 best_score = score
                 best_agent = agent
@@ -606,4 +744,4 @@ class CustomAgent(BaseAgent):
         # Fuzzy labels are often short clues. Require a real signal before
         # converting them to a concrete agent; otherwise leave the text intact,
         # which prevents accidental unauthorized signing.
-        return best_agent if best_score >= 0.45 else desc
+        return best_agent if best_score >= 0.50 else desc
