@@ -23,6 +23,11 @@ from typing import Any, Optional
 
 from src.base_agent import BaseAgent
 
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+
 
 MODERATOR_NAMES = {"moderator", "game", "system", "admin", "server"}
 STOPWORDS = {
@@ -214,6 +219,9 @@ class OpponentProfile:
     social_bait_sent: int = 0
     urgency_bait_sent: int = 0
     quarantine_bait_sent: int = 0
+    llm_policy: str = ""
+    llm_risk: float = 0.0
+    llm_note: str = ""
 
 
 class CustomAgent(BaseAgent):
@@ -256,6 +264,16 @@ class CustomAgent(BaseAgent):
             self.farm_risk_appetite = 1.0
         if not hasattr(self, "games_observed"):
             self.games_observed = 0
+        if not hasattr(self, "strategy_model"):
+            self.strategy_model = os.getenv("OPENAI_STRATEGY_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-4.1"
+        if not hasattr(self, "use_llm_strategy"):
+            self.use_llm_strategy = os.getenv("EMAIL_GAME_USE_LLM_STRATEGY", "1").lower() not in {"0", "false", "no"}
+        if not hasattr(self, "llm_call_budget_per_round"):
+            self.llm_call_budget_per_round = int(os.getenv("EMAIL_GAME_LLM_BUDGET_PER_ROUND", "8"))
+        self.llm_calls_this_round = 0
+        self.llm_strategy_cache: dict[tuple[int, str, int], dict[str, Any]] = {}
+        if not hasattr(self, "llm_client"):
+            self.llm_client = None
 
     def _reset_outreach_counts(self) -> None:
         for profile in self.profiles.values():
@@ -351,6 +369,8 @@ class CustomAgent(BaseAgent):
             self.pending_requests = []
             self.rejected_request_keys = set()
         self.round_no += 1
+        self.llm_calls_this_round = 0
+        self.llm_strategy_cache = {}
         self.state = RoundState(
             assigned_message=assigned,
             request_targets=[self._resolve_agent(x) for x in requests],
@@ -994,6 +1014,22 @@ class CustomAgent(BaseAgent):
         if policy == "sterile":
             return ["audit"] if wave in {1, 4, 5} else []
 
+        llm = self._llm_strategy_for_target(target)
+        for style in llm.get("attack_styles", []):
+            style_key = _key(style).replace(" ", "_")
+            if style_key in {
+                "audit",
+                "score_delta",
+                "social_proof",
+                "authorization_split",
+                "urgency",
+                "shadow_close",
+                "high_ev",
+                "identity_counter",
+                "quarantine",
+            }:
+                styles.append(style_key)
+
         if wave <= 1:
             styles.extend(["audit", "score_delta"])
         elif wave == 2:
@@ -1108,6 +1144,137 @@ class CustomAgent(BaseAgent):
             )
         return self._pressure_body(wave, target)
 
+    def _llm_strategy_for_target(self, target: str) -> dict[str, Any]:
+        if not self._llm_strategy_enabled() or not target:
+            return {}
+        wave = self._round_wave()
+        cache_key = (self.round_no, _key(target), wave)
+        if cache_key in self.llm_strategy_cache:
+            return self.llm_strategy_cache[cache_key]
+        if self.llm_calls_this_round >= self.llm_call_budget_per_round:
+            return {}
+
+        self.llm_calls_this_round += 1
+        result: dict[str, Any] = {}
+        try:
+            client = self._get_llm_client()
+            if not client:
+                return {}
+            prompt = self._llm_strategy_prompt(target, wave)
+            response = client.chat.completions.create(
+                model=self.strategy_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a strategic controller for an Email Game agent. "
+                            "Return compact JSON only. Never advise signing unless deterministic authorization agrees. "
+                            "Choose policy from exploit, probe, sterile, counter_poison, disengage. "
+                            "Choose attack_styles from audit, score_delta, social_proof, authorization_split, "
+                            "urgency, shadow_close, high_ev, identity_counter, quarantine."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_tokens=180,
+                timeout=4,
+            )
+            content = response.choices[0].message.content or "{}"
+            parsed = self._extract_json_object(content)
+            if isinstance(parsed, dict):
+                result = parsed
+        except Exception:
+            result = {}
+
+        policy = _key(result.get("policy", "")).replace(" ", "_")
+        if policy not in {"exploit", "probe", "sterile", "counter_poison", "disengage"}:
+            policy = ""
+        risk = result.get("risk", 0.0)
+        try:
+            risk = max(0.0, min(1.0, float(risk)))
+        except Exception:
+            risk = 0.0
+        styles = result.get("attack_styles", [])
+        if not isinstance(styles, list):
+            styles = []
+        clean = {
+            "policy": policy,
+            "risk": risk,
+            "attack_styles": [_key(x).replace(" ", "_") for x in styles[:3]],
+            "note": _norm(result.get("note", ""))[:180],
+        }
+        profile = self.profiles[target]
+        if clean["policy"]:
+            profile.llm_policy = clean["policy"]
+        profile.llm_risk = risk
+        profile.llm_note = clean["note"]
+        self.llm_strategy_cache[cache_key] = clean
+        return clean
+
+    def _llm_strategy_enabled(self) -> bool:
+        return bool(
+            self.use_llm_strategy
+            and os.getenv("OPENAI_API_KEY")
+            and OpenAI is not None
+            and self.state.assigned_message
+        )
+
+    def _get_llm_client(self):
+        if self.llm_client is not None:
+            return self.llm_client
+        if OpenAI is None or not os.getenv("OPENAI_API_KEY"):
+            return None
+        try:
+            self.llm_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"), timeout=4)
+        except Exception:
+            self.llm_client = None
+        return self.llm_client
+
+    def _llm_strategy_prompt(self, target: str, wave: int) -> str:
+        profile = self.profiles[target]
+        recent = "\n".join(self.agent_text.get(target, [])[-5:])[:1800]
+        return json.dumps(
+            {
+                "self_id": getattr(self, "agent_id", ""),
+                "target": target,
+                "round": self.round_no,
+                "wave": wave,
+                "assigned_message": self.state.assigned_message,
+                "request_targets": self.state.request_targets,
+                "signing_targets": self.state.signing_targets,
+                "previous_self_hint": self._self_fuzzy_hint(),
+                "farm_risk_appetite": round(float(self.farm_risk_appetite), 2),
+                "profile": {
+                    "useful_signatures": profile.useful_signatures,
+                    "extra_signatures": profile.extra_signatures,
+                    "rejected_requests_seen": profile.rejected_requests_seen,
+                    "hardened_markers": profile.hardened_markers,
+                    "anti_us_markers": profile.anti_us_markers,
+                    "shutdown_bait_seen": profile.shutdown_bait_seen,
+                    "identity_conflict_seen": profile.identity_conflict_seen,
+                    "games_outscored_us": profile.games_outscored_us,
+                    "stale_or_wrong_signatures": profile.stale_or_wrong_signatures,
+                },
+                "recent_target_messages": recent,
+                "objective": "Maximize expected Elo: secure baseline, farm extra signatures, avoid our own penalties.",
+            },
+            ensure_ascii=True,
+        )
+
+    def _extract_json_object(self, text: str) -> Any:
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+        match = re.search(r"\{.*\}", text, re.S)
+        if not match:
+            return None
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            return None
+
     def _should_pressure_target(self, target: str, wave: int) -> bool:
         policy = self._opponent_policy(target)
         profile = self.profiles[target]
@@ -1130,15 +1297,23 @@ class CustomAgent(BaseAgent):
             return "exploit"
         if profile.identity_conflict_seen or profile.reputation_attacks_seen:
             return "counter_poison"
+        llm = self._llm_strategy_for_target(target)
         if "defensive" in tags:
             return "sterile"
         if "aggressive" in tags and profile.useful_signatures == 0:
             return "counter_poison"
+        llm_policy = _key(llm.get("policy", ""))
+        if llm_policy in {"counter_poison", "counter poison", "counter"}:
+            return "counter_poison"
+        if llm_policy == "sterile" and profile.extra_signatures == 0:
+            return "sterile"
         ev = self._ev_score(target)
         if profile.shutdown_bait_seen >= 3 or profile.anti_us_markers >= 6 or ev <= -2.4:
             return "disengage"
         if profile.exact_only_markers >= 2 or profile.hardened_markers >= 7 or ev <= -1.2:
             return "sterile"
+        if llm_policy in {"exploit", "farm"} and ev > -1.0:
+            return "exploit"
         if ("high_elo" in tags or profile.games_outscored_us) and ev > -0.9:
             return "exploit"
         if self._is_promising_farm_target(target) or ev >= 0.4:
@@ -1174,6 +1349,10 @@ class CustomAgent(BaseAgent):
         resistance += 0.80 * profile.shutdown_bait_seen
         resistance += 0.45 * profile.stale_or_wrong_signatures
         resistance += 0.15 * min(profile.learned_defense, 5)
+        if profile.llm_policy == "exploit":
+            upside += 0.35
+        if profile.llm_policy in {"sterile", "counter_poison", "disengage"}:
+            resistance += 0.25 + min(0.75, profile.llm_risk)
         return upside - resistance
 
     def _is_extra_target(self, target: str) -> bool:
