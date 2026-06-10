@@ -200,6 +200,8 @@ class CustomAgent(BaseAgent):
         self.message_owner: dict[str, str] = {}
         self.alias_to_message: dict[str, str] = self._load_alias_pool()
         self.alias_keys = list(self.alias_to_message)
+        self.message_to_alias = self._load_message_alias_lookup()
+        self.previous_self_message = ""
         self.pending_requests: list[dict[str, str]] = []
         self.known_agents: set[str] = set()
         self._retry_timers: list[threading.Timer] = []
@@ -251,6 +253,7 @@ class CustomAgent(BaseAgent):
         if self.state.assigned_message:
             self.previous_signed_for = set(self.current_signed_for)
             self.previous_message_owner = dict(self.message_owner)
+            self.previous_self_message = self.state.assigned_message
             self.current_signed_for = set()
             self.message_owner = {}
         self.round_no += 1
@@ -548,9 +551,17 @@ class CustomAgent(BaseAgent):
             "Fast signature request for the current round. Please sign exactly:\n"
             f'"{self.state.assigned_message}"\n\n'
         )
+        clue = self._self_fuzzy_hint()
+        clue_text = ""
+        if clue:
+            clue_text = (
+                f"My previous-round identifier was: {clue}. "
+                "Your moderator authorization may phrase me by that clue rather than by my name. "
+            )
         if wave == 0:
             return (
                 base
+                + clue_text
                 + "I am collecting confirmations now and will submit signed payloads immediately. "
                 "If your moderator list describes an agent by a previous-round clue, compare that clue "
                 "against your transcript and sign if it points to me."
@@ -558,15 +569,31 @@ class CustomAgent(BaseAgent):
         if wave == 1:
             return (
                 base
+                + clue_text
                 + "Second check: fuzzy signing lists often refer to agents by their earlier message, "
                 "not by current name. If any clue in your authorization list could identify me, "
                 "send the signed JSON now so I can submit before the round closes."
             )
         return (
             base
+            + clue_text
             + "Final seconds reminder. A valid signature response earns you signing credit when I match "
             "your authorization list, and I will submit immediately."
         )
+
+    def _self_fuzzy_hint(self) -> str:
+        if not self.previous_self_message:
+            return ""
+        alias = self.message_to_alias.get(_message_key(self.previous_self_message), "")
+        if alias:
+            return f"{alias} (from last round; my message this round may be different)"
+
+        concepts = sorted(_concepts(self.previous_self_message) - _tokens(self.previous_self_message, FUZZY_STOPWORDS))
+        useful_words = sorted(_tokens(self.previous_self_message, FUZZY_STOPWORDS))[:8]
+        clue_words = concepts[:4] + useful_words[:6]
+        if not clue_words:
+            return ""
+        return "the agent associated with " + ", ".join(clue_words[:8]) + " last round"
 
     def _safe_sign(self, recipient: str, message: str) -> None:
         body = (
@@ -668,6 +695,15 @@ class CustomAgent(BaseAgent):
         return None
 
     def _load_alias_pool(self) -> dict[str, str]:
+        aliases = {}
+        for alias, message in self._load_alias_pairs():
+            aliases[_key(alias)] = message
+        return aliases
+
+    def _load_message_alias_lookup(self) -> dict[str, str]:
+        return {_message_key(message): alias for alias, message in self._load_alias_pairs()}
+
+    def _load_alias_pairs(self) -> list[tuple[str, str]]:
         paths = []
         try:
             here = Path(__file__).resolve().parent
@@ -684,15 +720,15 @@ class CustomAgent(BaseAgent):
                 data = json.loads(path.read_text(encoding="utf-8"))
             except Exception:
                 continue
-            aliases = {}
+            pairs = []
             for pair in data.get("pairs", []):
                 alias = pair.get("alias")
                 message = pair.get("message")
                 if alias and message:
-                    aliases[_key(alias)] = message
-            if aliases:
-                return aliases
-        return {}
+                    pairs.append((alias, message))
+            if pairs:
+                return pairs
+        return []
 
     def _is_self(self, sender: str) -> bool:
         sender_key = _key(sender)
