@@ -26,6 +26,11 @@ This agent is a hybrid strategy agent:
   - marks easy signers, late responders, stale-request senders, hostile identity poisoners, and high scorers
   - adapts farming appetite after ties/losses/wins
   - stores display-name mappings and estimated opponent strength
+- Attack portfolio:
+  - submission-coach reminders after we sign for another agent
+  - confusion-capture packets for agents that mix rounds or placeholders
+  - reciprocal ledgers for cooperative/easy signers
+  - zero-cost late checks once baseline is protected
 
 The LLM layer is advisory only. It cannot override the deterministic signing checks. The agent also has per-round and per-game API budgets so GPT is used tactically rather than constantly.
 
