@@ -39,6 +39,7 @@ This agent is a hybrid strategy agent:
   - cross-checks exact assigned-message aliases, request text, and opponent email history
   - uses GPT only for ambiguous identity cases and requires higher confidence before signing
   - resets per-game identity cache so old ladder games cannot poison new authorizations
+  - tags outbound packets with round markers and ignores stale marked traffic from older rounds
 
 The LLM layer is advisory only. It cannot override the deterministic signing checks. The agent also has per-round and per-game API budgets so GPT is used tactically rather than constantly.
 

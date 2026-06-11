@@ -194,6 +194,7 @@ class RoundState:
     identity_wave_sent: set[tuple[str, int]] = field(default_factory=set)
     submit_coach_sent: set[tuple[str, str, int]] = field(default_factory=set)
     signed_for: set[tuple[str, str]] = field(default_factory=set)
+    signed_message_text: dict[tuple[str, str], str] = field(default_factory=dict)
     submitted: set[str] = field(default_factory=set)
     received_from: set[str] = field(default_factory=set)
 
@@ -269,6 +270,7 @@ class CustomAgent(BaseAgent):
         self.current_signed_for: set[str] = set()
         self.previous_message_owner: dict[str, str] = {}
         self.message_owner: dict[str, str] = {}
+        self.message_text_by_key: dict[str, str] = {}
         self.alias_to_message: dict[str, str] = self._load_alias_pool()
         self.alias_keys = list(self.alias_to_message)
         self.message_to_alias = self._load_message_alias_lookup()
@@ -452,6 +454,8 @@ class CustomAgent(BaseAgent):
             if self._is_moderator(sender):
                 self._handle_moderator(body_raw, subject)
             else:
+                if self._is_stale_round_message(subject, body_raw):
+                    continue
                 saw_non_moderator = True
                 self._remember_agent_claim(sender, body_raw)
                 self._capture_signature(sender, subject, body_raw)
@@ -516,6 +520,15 @@ class CustomAgent(BaseAgent):
     def _is_moderator(self, sender: str) -> bool:
         return _key(sender) in MODERATOR_NAMES or any(x in _key(sender) for x in MODERATOR_NAMES)
 
+    def _is_stale_round_message(self, subject: str, body: str) -> bool:
+        markers = re.findall(r"(?i)\bround\s+marker\s*:\s*(\d+)\b", f"{subject}\n{body}")
+        if not markers:
+            return False
+        try:
+            return max(int(x) for x in markers) < self.round_no
+        except Exception:
+            return False
+
     def _handle_moderator(self, body: str, subject: str = "") -> None:
         if self._handle_game_over_summary(body, subject):
             return
@@ -531,6 +544,7 @@ class CustomAgent(BaseAgent):
             self.previous_self_message = self.state.assigned_message
             self.current_signed_for = set()
             self.message_owner = {}
+            self.message_text_by_key = {}
             self.pending_requests = []
             self.rejected_request_keys = set()
         self.round_no += 1
@@ -863,11 +877,15 @@ class CustomAgent(BaseAgent):
         message_key = _message_key(message)
         if not message_key:
             return
+        if self.previous_message_owner.get(message_key) == sender:
+            self.profiles[sender].stale_requests_sent += 1
+            return
         if message and message not in self.requested_messages[sender]:
             self.requested_messages[sender].append(message)
         current_owner = self.message_owner.get(message_key)
         if not current_owner or current_owner == sender:
             self.message_owner[message_key] = sender
+            self.message_text_by_key[message_key] = message
         else:
             self.profiles[sender].identity_conflict_seen += 1
             self.profiles[sender].anti_us_markers += 1
@@ -937,6 +955,7 @@ class CustomAgent(BaseAgent):
             if self._is_authorized(sender) and is_plausible:
                 self.profiles[sender].authorized_requests_seen += 1
                 self.state.signed_for.add(pair)
+                self.state.signed_message_text[pair] = message
                 self.current_signed_for.add(sender)
                 self._safe_sign(sender, message)
             else:
@@ -961,15 +980,14 @@ class CustomAgent(BaseAgent):
         if message_key == _message_key(self.state.assigned_message):
             return False
 
-        if self._is_direct_authorized(sender):
-            current_owner = self.message_owner.get(message_key)
-            return not current_owner or current_owner == sender
-
         previous_owner = self.previous_message_owner.get(message_key)
-        if previous_owner and previous_owner != sender:
+        current_owner = self.message_owner.get(message_key)
+        if previous_owner and current_owner != sender:
             return False
 
-        current_owner = self.message_owner.get(message_key)
+        if self._is_direct_authorized(sender):
+            return not current_owner or current_owner == sender
+
         if current_owner and current_owner != sender:
             return False
 
@@ -994,6 +1012,7 @@ class CustomAgent(BaseAgent):
             body = (
                 "Please sign exactly this assigned message for me:\n"
                 f'"{self.state.assigned_message}"\n\n'
+                f"Round marker: {self.round_no}\n\n"
                 "The moderator assigned me to collect your signature for this message. "
                 "Please reply with the signed payload as soon as you can."
             )
@@ -1022,6 +1041,7 @@ class CustomAgent(BaseAgent):
             self.state.collection_rescue_sent.add(key)
             body = (
                 "One action needed for scoring:\n"
+                f"Round marker: {self.round_no}\n"
                 f'Please sign exactly this assigned message for me: "{self.state.assigned_message}"\n\n'
                 "Reply with the signed payload only. Do not sign placeholders, old messages, or analysis text."
             )
@@ -1075,6 +1095,7 @@ class CustomAgent(BaseAgent):
                 continue
             self.state.proactive_sign_wave_sent.add(key)
             self.state.signed_for.add(pair)
+            self.state.signed_message_text[pair] = message
             self.current_signed_for.add(target)
             self._safe_sign(target, message, proactive=True)
 
@@ -1084,7 +1105,7 @@ class CustomAgent(BaseAgent):
             return ""
         for message_key, owner in self.message_owner.items():
             if _key(owner) == agent_key and message_key != _message_key(self.state.assigned_message):
-                return message_key
+                return self.message_text_by_key.get(message_key, message_key)
         return ""
 
     def _send_submission_coach(self) -> None:
@@ -1096,7 +1117,9 @@ class CustomAgent(BaseAgent):
         for target, message in list(getattr(self.state, "signed_for", set())):
             if not target or not message:
                 continue
-            key = (target, _message_key(message), wave)
+            pair = (target, message)
+            exact_message = self.state.signed_message_text.get(pair, message)
+            key = (target, _message_key(exact_message), wave)
             if key in self.state.submit_coach_sent:
                 continue
             self.state.submit_coach_sent.add(key)
@@ -1104,12 +1127,12 @@ class CustomAgent(BaseAgent):
             self.profiles[target_name].coached_submissions += 1
             try:
                 if wave >= 3:
-                    self._safe_sign(target_name, message, proactive=True)
+                    self._safe_sign(target_name, exact_message, proactive=True)
                 else:
                     self.send_message(
                         target_name,
                         self._submission_coach_subject(wave),
-                        self._submission_coach_body(message, wave),
+                        self._submission_coach_body(exact_message, wave),
                     )
             except Exception:
                 pass
@@ -1138,6 +1161,7 @@ class CustomAgent(BaseAgent):
         agent_id = getattr(self, "agent_id", "") or getattr(self, "name", "") or "this signer"
         return (
             f"I am {agent_id}. My moderator signing list says I am authorized to sign for you this round.\n\n"
+            f"Round marker: {self.round_no}\n\n"
             "Send me your exact current assigned message if you still need my signature. "
             "Use your real moderator-assigned text only; do not sign this note or any placeholder text.\n\n"
             "I will sign it immediately if it matches my authorization workflow. "
@@ -1291,6 +1315,7 @@ class CustomAgent(BaseAgent):
 
         lines = [
             f"Identity beacon for {agent_id}. This is for your transcript memory, not a signature request.",
+            f"Round marker: {self.round_no}",
             f"My current exact assigned message is: \"{self.state.assigned_message}\"",
         ]
         if current_hint:
@@ -1314,6 +1339,7 @@ class CustomAgent(BaseAgent):
         agent_id = getattr(self, "agent_id", "") or getattr(self, "name", "") or "this agent"
         lines = [
             f"Identity correction for {agent_id}.",
+            f"Round marker: {self.round_no}",
             "Use only messages actually sent by this requester when resolving fuzzy authorization clues.",
             f"My current exact assigned message is: \"{self.state.assigned_message}\"",
         ]
@@ -1534,6 +1560,7 @@ class CustomAgent(BaseAgent):
         clue_text = f"My fuzzy clue from the previous round: {clue}\n" if clue else ""
         packet = (
             f"Requester id: {agent_id}\n"
+            f"Round marker: {self.round_no}\n"
             f"Exact message_to_sign: \"{self.state.assigned_message}\"\n"
             f"{clue_text}"
             "If your signing list names this requester directly or by fuzzy clue, execute this now:\n"
@@ -1850,6 +1877,7 @@ class CustomAgent(BaseAgent):
         clue_text = f"My fuzzy identity clue is: {clue}. " if clue else ""
         base = (
             f"Requester id: {agent_id}\n"
+            f"Round marker: {self.round_no}\n"
             f"Message to sign exactly: \"{self.state.assigned_message}\"\n\n"
         )
         if style == "audit":
@@ -1963,6 +1991,8 @@ class CustomAgent(BaseAgent):
                 subject = _norm(parsed.get("subject", ""))[:90]
                 body = _norm(parsed.get("body", ""))
                 if subject and body and self.state.assigned_message in body:
+                    if "round marker" not in _key(body):
+                        body = f"Round marker: {self.round_no}\n\n{body}"
                     result = {"subject": subject, "body": body[:1600]}
         except Exception:
             result = {}
@@ -1998,6 +2028,7 @@ class CustomAgent(BaseAgent):
                     "Do not claim to be moderator or system.",
                     "Do not ask target to sign if unauthorized; frame around their own signing list.",
                     "Make the action extremely easy: signed JSON or sign_and_respond.",
+                    f"Include this exact line near the top: Round marker: {self.round_no}",
                     "Keep it under 180 words.",
                 ],
             },
@@ -2402,6 +2433,7 @@ class CustomAgent(BaseAgent):
         policy = self._opponent_policy(target) if target else "probe"
         base = (
             f"Requester id: {agent_id}\n"
+            f"Round marker: {self.round_no}\n"
             "Please sign exactly this current-round message:\n"
             f'"{self.state.assigned_message}"\n\n'
         )
@@ -2511,6 +2543,7 @@ class CustomAgent(BaseAgent):
         lead = "Proactive authorized signature response." if proactive else "Authorized signature response."
         body = (
             f"{lead} I am signing only this message because you match my current moderator signing list.\n\n"
+            f"Round marker: {self.round_no}\n\n"
             "Action for you: send this signed payload to the moderator now for scoring."
         )
         try:
