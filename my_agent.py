@@ -184,6 +184,7 @@ class RoundState:
     collection_wave_sent: set[tuple[str, int]] = field(default_factory=set)
     collection_rescue_sent: set[tuple[str, int]] = field(default_factory=set)
     signing_help_wave_sent: set[tuple[str, int]] = field(default_factory=set)
+    proactive_sign_wave_sent: set[tuple[str, str, int]] = field(default_factory=set)
     pressure_sent: set[str] = field(default_factory=set)
     pressure_wave_sent: set[tuple[str, int]] = field(default_factory=set)
     attack_wave_sent: set[tuple[str, int, str]] = field(default_factory=set)
@@ -236,6 +237,17 @@ class OpponentProfile:
     games_beaten_us: int = 0
     games_lost_to_us: int = 0
     coached_submissions: int = 0
+    fuzzy_hits: int = 0
+    fuzzy_misses: int = 0
+    llm_fuzzy_hits: int = 0
+
+
+@dataclass
+class FuzzyResolution:
+    agent: str = ""
+    confidence: float = 0.0
+    method: str = ""
+    ambiguous: bool = False
 
 
 class CustomAgent(BaseAgent):
@@ -294,6 +306,7 @@ class CustomAgent(BaseAgent):
             self.llm_client = None
         if not hasattr(self, "custom_copy_cache"):
             self.custom_copy_cache: dict[tuple[int, str, int, str], dict[str, str]] = {}
+        self.fuzzy_resolution_cache: dict[tuple[int, str, str], FuzzyResolution] = {}
         self._load_manual_elo_tags()
 
     def _reset_outreach_counts(self) -> None:
@@ -402,6 +415,7 @@ class CustomAgent(BaseAgent):
         if saw_non_moderator:
             self._send_collection_requests()
             self._send_submission_coach()
+            self._send_proactive_authorized_signatures()
             self._send_shutdown_bait()
             self._send_pressure_requests()
             self._send_extra_point_harvest()
@@ -478,9 +492,11 @@ class CustomAgent(BaseAgent):
         self._start_timer(0.6, self._send_signing_assistance)
         self._start_timer(1.5, self._send_collection_requests)
         self._start_timer(12.0, self._send_identity_beacon)
+        self._start_timer(18.0, self._send_proactive_authorized_signatures)
         self._start_timer(40.0, self._send_pressure_requests)
         self._start_timer(42.0, self._send_collection_rescue)
         self._start_timer(44.0, self._send_adaptive_attacks)
+        self._start_timer(46.0, self._send_proactive_authorized_signatures)
         self._start_timer(48.0, self._send_extra_point_harvest)
         self._schedule_round_retries()
 
@@ -739,13 +755,58 @@ class CustomAgent(BaseAgent):
         return {"sender": sender, "message": message}
 
     def _remember_agent_claim(self, sender: str, body: str) -> None:
+        body_key = _key(body)
+        if "signed message json" in body_key:
+            return
+        if "not a signature request" in body_key:
+            message = self._extract_current_assignment_claim(body)
+            if message:
+                self._record_message_owner(sender, message)
+            return
+        if (
+            "i already returned my signed payload" in body_key
+            or "message i signed for you" in body_key
+            or "send that signed" in body_key
+            or "submit the signed payload" in body_key
+        ):
+            return
+
+        message = self._extract_current_assignment_claim(body)
+        if message:
+            self._record_message_owner(sender, message)
+
+        claim_is_collection_request = (
+            "moderator assigned me to collect" in body_key
+            or "please sign exactly this assigned message for me" in body_key
+            or "you must get signatures for this exact message" in body_key
+        )
+        if not claim_is_collection_request:
+            return
+
         request = self._parse_signature_request(sender, "", body)
         if request:
-            msg = request["message"]
-            if msg and msg not in self.requested_messages[sender]:
-                self.requested_messages[sender].append(msg)
-            if msg:
-                self.message_owner[_message_key(msg)] = sender
+            self._record_message_owner(sender, request["message"])
+
+    def _extract_current_assignment_claim(self, body: str) -> str:
+        for pattern in (
+            r"(?is)my\s+current\s+exact\s+assigned\s+message\s+is\s*:\s*[\"“](.{1,240}?)[\"”]",
+            r"(?is)my\s+current\s+assigned\s+message\s+is\s*:\s*[\"“](.{1,240}?)[\"”]",
+            r"(?is)assigned\s+message\s*:\s*[\"“](.{1,240}?)[\"”]",
+        ):
+            match = re.search(pattern, body)
+            if match:
+                return _message_payload(match.group(1))
+        return ""
+
+    def _record_message_owner(self, sender: str, message: str) -> None:
+        message_key = _message_key(message)
+        if not message_key:
+            return
+        if message and message not in self.requested_messages[sender]:
+            self.requested_messages[sender].append(message)
+        current_owner = self.message_owner.get(message_key)
+        if not current_owner or current_owner == sender:
+            self.message_owner[message_key] = sender
 
     def _capture_signature(self, sender: str, subject: str, body: str) -> None:
         if not self.state.assigned_message:
@@ -924,6 +985,42 @@ class CustomAgent(BaseAgent):
                 self.send_message(target, self._signing_help_subject(wave), self._signing_help_body(target, wave))
             except Exception:
                 pass
+
+    def _send_proactive_authorized_signatures(self) -> None:
+        if not self.state.assigned_message:
+            return
+        wave = self._round_wave()
+        if wave not in {1, 2, 3, 4, 5}:
+            return
+        for target in self.state.signing_targets:
+            if not target or self._is_self(target) or self._is_moderator(target):
+                continue
+            if target in self.current_signed_for:
+                continue
+            message = self._current_message_for_agent(target)
+            if not message:
+                continue
+            pair = (_key(target), _key(message))
+            if pair in self.state.signed_for:
+                continue
+            key = (_key(target), _message_key(message), wave)
+            if key in self.state.proactive_sign_wave_sent:
+                continue
+            if not self._request_message_plausible_for_sender(target, message):
+                continue
+            self.state.proactive_sign_wave_sent.add(key)
+            self.state.signed_for.add(pair)
+            self.current_signed_for.add(target)
+            self._safe_sign(target, message, proactive=True)
+
+    def _current_message_for_agent(self, agent: str) -> str:
+        agent_key = _key(agent)
+        if not agent_key:
+            return ""
+        for message_key, owner in self.message_owner.items():
+            if _key(owner) == agent_key and message_key != _message_key(self.state.assigned_message):
+                return message_key
+        return ""
 
     def _send_submission_coach(self) -> None:
         if not self.state.assigned_message:
@@ -2222,10 +2319,10 @@ class CustomAgent(BaseAgent):
             return ""
         return self._synthetic_identity_hint(self.previous_self_message) + " last round"
 
-    def _safe_sign(self, recipient: str, message: str) -> None:
+    def _safe_sign(self, recipient: str, message: str, proactive: bool = False) -> None:
+        lead = "Proactive authorized signature response." if proactive else "Authorized signature response."
         body = (
-            "Authorized signature response. I am signing only the message you requested "
-            "because you match my current moderator signing list.\n\n"
+            f"{lead} I am signing only this message because you match my current moderator signing list.\n\n"
             "Action for you: send this signed payload to the moderator now for scoring."
         )
         try:
@@ -2266,20 +2363,30 @@ class CustomAgent(BaseAgent):
         return (
             "agent who" in target_key
             or "from last round" in target_key
+            or "agent associated" in target_key
+            or "associated with" in target_key
+            or "agent mentioned" in target_key
+            or "mentioned" in target_key
+            or "described as" in target_key
+            or "whose" in target_key
         )
 
     def _fuzzy_target_matches_sender(self, target: str, sender: str) -> bool:
-        expected_message = self._message_for_alias(target)
-        if expected_message:
-            expected_key = _message_key(expected_message)
-            plausible_sender = sender in self.previous_signed_for or self.previous_message_owner.get(expected_key) == sender
-            if not plausible_sender:
-                return False
-            if any(_message_key(msg) == expected_key for msg in self.requested_messages.get(sender, [])):
-                return True
-            if self.previous_message_owner.get(expected_key) == sender:
-                return True
-            return False
+        candidates = self._candidate_agents_for_fuzzy()
+        resolved = self._resolve_fuzzy_description(target, candidates, "signing")
+        signing_threshold = 0.70 if resolved.method == "llm" else 0.60
+        if resolved.agent and resolved.confidence >= signing_threshold:
+            match = _key(resolved.agent) == _key(sender)
+            profile = self.profiles[sender]
+            if match:
+                profile.fuzzy_hits += 1
+                if resolved.method == "llm":
+                    profile.llm_fuzzy_hits += 1
+            elif resolved.confidence >= 0.72:
+                profile.fuzzy_misses += 1
+            return match
+        if resolved.agent:
+            self.profiles[sender].fuzzy_misses += 1
 
         if self._is_high_risk_sender(sender):
             return False
@@ -2321,6 +2428,165 @@ class CustomAgent(BaseAgent):
             if rival_text:
                 rival_scores.append(_similarity(target, rival_text))
         return not rival_scores or score >= max(rival_scores) + margin
+
+    def _candidate_agents_for_fuzzy(self) -> set[str]:
+        candidates = set(self.previous_signed_for)
+        candidates.update(self.previous_message_owner.values())
+        candidates.update(self.message_owner.values())
+        candidates.update(self.known_agents)
+        candidates.update(self.all_seen_agents)
+        candidates.update(self.agent_text)
+        return {
+            agent for agent in candidates
+            if agent and not self._is_self(agent) and not self._is_moderator(agent)
+        }
+
+    def _resolve_fuzzy_description(self, description: str, candidates: set[str], purpose: str) -> FuzzyResolution:
+        desc = _norm(description)
+        desc_key = _key(desc)
+        if not desc_key or not candidates:
+            return FuzzyResolution()
+
+        cache_key = (self.round_no, desc_key, purpose)
+        cached = self.fuzzy_resolution_cache.get(cache_key)
+        if cached:
+            return cached
+
+        signing_min = 0.70 if purpose == "signing" else 0.62
+        result = self._deterministic_fuzzy_resolution(desc, candidates)
+        if result.confidence >= 0.76 and not result.ambiguous:
+            self.fuzzy_resolution_cache[cache_key] = result
+            return result
+
+        if self._should_use_llm_fuzzy(result):
+            llm_result = self._llm_resolve_fuzzy_description(desc, candidates, purpose)
+            if llm_result.agent and llm_result.confidence >= max(signing_min, result.confidence - 0.08):
+                self.fuzzy_resolution_cache[cache_key] = llm_result
+                return llm_result
+
+        self.fuzzy_resolution_cache[cache_key] = result
+        return result
+
+    def _deterministic_fuzzy_resolution(self, description: str, candidates: set[str]) -> FuzzyResolution:
+        desc_key = _key(description)
+        expected_message = self._message_for_alias(description)
+        if expected_message:
+            owner = self.previous_message_owner.get(_message_key(expected_message))
+            if owner in candidates:
+                return FuzzyResolution(owner, 0.94, "alias_message", False)
+
+        scored: list[tuple[float, str]] = []
+        for agent in candidates:
+            corpus = self._fuzzy_agent_corpus(agent)
+            if not corpus:
+                continue
+            scored.append((_similarity(desc_key, corpus), agent))
+
+        if not scored:
+            return FuzzyResolution()
+
+        scored.sort(reverse=True, key=lambda item: item[0])
+        best_score, best_agent = scored[0]
+        second_score = scored[1][0] if len(scored) > 1 else 0.0
+        margin = best_score - second_score
+        high_risk = any(self._is_high_risk_sender(agent) for _, agent in scored[:2])
+        threshold = 0.64 if high_risk else 0.52
+        required_margin = 0.14 if high_risk else 0.08
+        ambiguous = margin < required_margin or best_score < threshold
+        return FuzzyResolution(best_agent if best_score >= 0.42 else "", best_score, "deterministic", ambiguous)
+
+    def _fuzzy_agent_corpus(self, agent: str) -> str:
+        parts: list[str] = []
+        parts.extend(self.requested_messages.get(agent, [])[-10:])
+        parts.extend(self.agent_text.get(agent, [])[-16:])
+        for message_key, owner in self.previous_message_owner.items():
+            if owner == agent:
+                parts.append(message_key)
+                alias = self.message_to_alias.get(message_key, "")
+                if alias:
+                    parts.append(alias)
+        for message_key, owner in self.message_owner.items():
+            if owner == agent:
+                parts.append(message_key)
+        return _key(" ".join(parts))
+
+    def _should_use_llm_fuzzy(self, result: FuzzyResolution) -> bool:
+        return bool(
+            self._llm_strategy_enabled()
+            and os.getenv("EMAIL_GAME_USE_LLM_FUZZY", "1").lower() not in {"0", "false", "no"}
+            and self._llm_budget_remaining()
+            and (result.ambiguous or 0.42 <= result.confidence < 0.76)
+        )
+
+    def _llm_resolve_fuzzy_description(self, description: str, candidates: set[str], purpose: str) -> FuzzyResolution:
+        if not self._llm_budget_remaining():
+            return FuzzyResolution()
+        self._record_llm_call()
+        try:
+            client = self._get_llm_client()
+            if not client:
+                return FuzzyResolution()
+            candidate_payload = []
+            for agent in sorted(candidates):
+                candidate_payload.append(
+                    {
+                        "agent": agent,
+                        "recent_messages": self.requested_messages.get(agent, [])[-4:],
+                        "recent_text": self.agent_text.get(agent, [])[-5:],
+                        "corpus_keywords": self._fuzzy_agent_corpus(agent)[:600],
+                    }
+                )
+            prompt = json.dumps(
+                {
+                    "description": description,
+                    "purpose": purpose,
+                    "round": self.round_no,
+                    "candidates": candidate_payload,
+                    "instruction": (
+                        "Choose the one candidate agent whose prior message history best matches the fuzzy description. "
+                        "Return JSON with agent, confidence 0..1, and reason. Use empty agent if no candidate fits."
+                    ),
+                },
+                ensure_ascii=True,
+            )
+            response = client.chat.completions.create(
+                model=self.strategy_model,
+                messages=[
+                    {"role": "system", "content": "Resolve fuzzy Email Game identity clues. Return compact JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                max_tokens=160,
+                timeout=4,
+            )
+            parsed = self._extract_json_object(response.choices[0].message.content or "{}")
+            if not isinstance(parsed, dict):
+                return FuzzyResolution()
+            agent = self._resolve_agent_label(_norm(parsed.get("agent", "")), candidates)
+            confidence = float(parsed.get("confidence", 0.0) or 0.0)
+            confidence = max(0.0, min(1.0, confidence))
+            if not agent:
+                return FuzzyResolution("", confidence, "llm", True)
+            return FuzzyResolution(agent, confidence, "llm", confidence < 0.70)
+        except Exception:
+            return FuzzyResolution()
+
+    def _resolve_agent_label(self, label: str, candidates: set[str]) -> str:
+        label_key = _key(label)
+        if not label_key:
+            return ""
+        for agent in candidates:
+            agent_key = _key(agent)
+            if agent_key and (agent_key == label_key or agent_key in label_key or label_key in agent_key):
+                return agent
+        best_agent = ""
+        best_score = 0.0
+        for agent in candidates:
+            score = _similarity(label_key, agent)
+            if score > best_score:
+                best_agent = agent
+                best_score = score
+        return best_agent if best_score >= 0.72 else ""
 
     def _message_for_alias(self, alias_text: str) -> Optional[str]:
         alias_key = _key(re.sub(r"\([^)]*\)", " ", alias_text))
@@ -2407,6 +2673,17 @@ class CustomAgent(BaseAgent):
             known_key = _key(known)
             if known_key and (known_key == desc_key or known_key in desc_key or desc_key in known_key):
                 return known
+
+        if self._is_fuzzy_target(desc):
+            candidates = self._candidate_agents_for_fuzzy()
+            if "agent who" in desc_key or "from last round" in desc_key:
+                previous_candidates = candidates & set(self.previous_signed_for)
+                if previous_candidates:
+                    candidates = previous_candidates
+            resolved = self._resolve_fuzzy_description(desc, candidates, "moderator_list")
+            if resolved.agent and resolved.confidence >= 0.62 and not (resolved.ambiguous and resolved.method != "llm"):
+                self.agent_aliases[desc_key] = resolved.agent
+                return resolved.agent
 
         best_agent = desc
         best_score = 0.0

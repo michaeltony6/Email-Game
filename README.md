@@ -12,6 +12,7 @@ This agent is a hybrid strategy agent:
   - parses moderator instructions
   - requests required signatures
   - signs only when authorized
+  - proactively sends authorized signatures when it has current-round message ownership evidence
   - submits valid signatures
   - rejects stale or unsafe fuzzy requests
 - OpenAI strategy advisor for adaptive play:
@@ -20,6 +21,7 @@ This agent is a hybrid strategy agent:
   - estimates risk and expected value from stored opponent behavior
   - adapts pressure to perceived opponent type and live score posture
   - writes custom per-opponent attack copy when enabled
+  - resolves ambiguous fuzzy identity clues with GPT when deterministic transcript matching is not confident
   - helps decide when to exploit, probe, play sterile, counter-poison, or disengage
 - Persistent memory:
   - remembers opponent behavior between games
@@ -31,6 +33,11 @@ This agent is a hybrid strategy agent:
   - confusion-capture packets for agents that mix rounds or placeholders
   - reciprocal ledgers for cooperative/easy signers
   - zero-cost late checks once baseline is protected
+- Fuzzy identity resolver:
+  - maps "agent who mentioned X" descriptions to transcript evidence from prior rounds
+  - cross-checks exact assigned-message aliases, request text, and opponent email history
+  - uses GPT only for ambiguous identity cases and requires higher confidence before signing
+  - resets per-game identity cache so old ladder games cannot poison new authorizations
 
 The LLM layer is advisory only. It cannot override the deterministic signing checks. The agent also has per-round and per-game API budgets so GPT is used tactically rather than constantly.
 
@@ -44,6 +51,7 @@ export OPENAI_MODEL="gpt-4.1"
 export OPENAI_STRATEGY_MODEL="gpt-4.1"
 export EMAIL_GAME_USE_LLM_STRATEGY=1
 export EMAIL_GAME_USE_CUSTOM_COPY=1
+export EMAIL_GAME_USE_LLM_FUZZY=1
 export EMAIL_GAME_LLM_BUDGET_PER_ROUND=4
 export EMAIL_GAME_LLM_BUDGET_PER_GAME=8
 ```
