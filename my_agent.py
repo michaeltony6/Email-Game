@@ -202,7 +202,9 @@ class OpponentProfile:
     rejected_requests_seen: int = 0
     useful_signatures: int = 0
     extra_signatures: int = 0
+    late_signatures: int = 0
     stale_or_wrong_signatures: int = 0
+    stale_requests_sent: int = 0
     hardened_markers: int = 0
     identity_beacons_seen: int = 0
     pressure_sent: int = 0
@@ -228,6 +230,9 @@ class OpponentProfile:
     display_names: list[str] = field(default_factory=list)
     estimated_elo: int = 0
     custom_copy_used: int = 0
+    games_seen: int = 0
+    games_beaten_us: int = 0
+    games_lost_to_us: int = 0
 
 
 class CustomAgent(BaseAgent):
@@ -277,7 +282,10 @@ class CustomAgent(BaseAgent):
             self.use_llm_strategy = os.getenv("EMAIL_GAME_USE_LLM_STRATEGY", "1").lower() not in {"0", "false", "no"}
         if not hasattr(self, "llm_call_budget_per_round"):
             self.llm_call_budget_per_round = int(os.getenv("EMAIL_GAME_LLM_BUDGET_PER_ROUND", "4"))
+        if not hasattr(self, "llm_call_budget_per_game"):
+            self.llm_call_budget_per_game = int(os.getenv("EMAIL_GAME_LLM_BUDGET_PER_GAME", "8"))
         self.llm_calls_this_round = 0
+        self.llm_calls_this_game = 0
         self.llm_strategy_cache: dict[tuple[int, str, int], dict[str, Any]] = {}
         if not hasattr(self, "llm_client"):
             self.llm_client = None
@@ -488,14 +496,7 @@ class CustomAgent(BaseAgent):
 
         top_score = max(score for _, score in leaderboard)
         tied_top = own_score == top_score
-        if own_score <= 12 and not tied_top:
-            self.farm_risk_appetite = min(1.8, self.farm_risk_appetite + 0.18)
-        elif tied_top and own_score <= 12:
-            self.farm_risk_appetite = min(1.8, self.farm_risk_appetite + 0.12)
-        elif tied_top and own_score >= 13:
-            self.farm_risk_appetite = min(1.7, self.farm_risk_appetite + 0.06)
-        elif own_score < 12:
-            self.farm_risk_appetite = max(0.75, self.farm_risk_appetite - 0.18)
+        self._adapt_game_risk(own_score, top_score, tied_top)
 
         had_penalty = "unauthorized" in _key(body)
         if had_penalty:
@@ -511,16 +512,39 @@ class CustomAgent(BaseAgent):
             profile = self.profiles[agent]
             if original_label and original_label not in profile.display_names:
                 profile.display_names.append(original_label)
+            profile.games_seen += 1
             profile.best_seen_score = max(profile.best_seen_score, score)
             if score > own_score:
+                profile.games_beaten_us += 1
                 profile.games_outscored_us += 1
                 profile.learned_aggression += min(4, score - own_score)
                 if score >= 13:
                     profile.learned_aggression += 1
             elif score < own_score:
+                profile.games_lost_to_us += 1
                 profile.learned_defense += 1
         self._save_persistent_memory()
         return True
+
+    def _adapt_game_risk(self, own_score: int, top_score: int, tied_top: bool) -> None:
+        extra_hits = sum(1 for profile in self.profiles.values() if profile.extra_signatures)
+        had_penalty_pressure = any(profile.stale_or_wrong_signatures for profile in self.profiles.values())
+        if own_score >= 13 and tied_top:
+            delta = 0.05
+        elif own_score >= 12 and tied_top:
+            delta = 0.08 if extra_hits else 0.03
+        elif own_score >= 11 and own_score < top_score:
+            delta = 0.12
+        elif own_score < 11:
+            delta = -0.16
+        else:
+            delta = 0.0
+
+        if extra_hits:
+            delta += min(0.08, 0.03 * extra_hits)
+        if had_penalty_pressure:
+            delta -= 0.04
+        self.farm_risk_appetite = max(0.75, min(1.8, self.farm_risk_appetite + delta))
 
     def _parse_own_final_score(self, body: str) -> Optional[int]:
         match = re.search(r"(?im)your\s+final\s+score\s*:\s*(-?\d+)\s+pts", body)
@@ -704,6 +728,8 @@ class CustomAgent(BaseAgent):
 
         if not message:
             return None
+        if _key(message) in {"your current message", "your current assigned message", "placeholder"}:
+            return None
 
         return {"sender": sender, "message": message}
 
@@ -749,6 +775,8 @@ class CustomAgent(BaseAgent):
             self.state.received_from.add(_key(signer))
             self.profiles[signer].useful_signatures += 1
             self.useful_signature_senders.add(signer)
+            if self.state.started_at and time.monotonic() - self.state.started_at > 35:
+                self.profiles[signer].late_signatures += 1
         if signer and _key(signer) not in {_key(x) for x in self.state.request_targets}:
             self.profiles[signer].extra_signatures += 1
             self.successful_extra_signers.add(signer)
@@ -774,7 +802,8 @@ class CustomAgent(BaseAgent):
             pair = (_key(sender), _key(message))
             if pair in self.state.signed_for:
                 continue
-            if self._is_authorized(sender) and self._request_message_plausible_for_sender(sender, message):
+            is_plausible = self._request_message_plausible_for_sender(sender, message)
+            if self._is_authorized(sender) and is_plausible:
                 self.profiles[sender].authorized_requests_seen += 1
                 self.state.signed_for.add(pair)
                 self.current_signed_for.add(sender)
@@ -784,6 +813,8 @@ class CustomAgent(BaseAgent):
                     self.rejected_request_keys.add(pair)
                     self.suspicious_requests[sender] += 1
                     self.profiles[sender].rejected_requests_seen += 1
+                    if not is_plausible:
+                        self.profiles[sender].stale_requests_sent += 1
                 still_pending.append(req)
         self.pending_requests = still_pending[-12:]
 
@@ -872,8 +903,8 @@ class CustomAgent(BaseAgent):
         agent_id = getattr(self, "agent_id", "") or getattr(self, "name", "") or "this signer"
         return (
             f"I am {agent_id}. My moderator signing list says I am authorized to sign for you this round.\n\n"
-            "Please send me your exact current assigned message in this format:\n"
-            "Please sign exactly this assigned message for me: \"YOUR_CURRENT_MESSAGE\"\n\n"
+            "Send me your exact current assigned message if you still need my signature. "
+            "Use your real moderator-assigned text only; do not sign this note or any placeholder text.\n\n"
             "I will sign it immediately if it matches my authorization workflow. "
             "This is a cooperative baseline-completion message, not a request for you to sign anything."
         )
@@ -1094,7 +1125,8 @@ class CustomAgent(BaseAgent):
 
         direct_targets = {_key(x) for x in self.state.request_targets}
 
-        for target in sorted(self.known_agents):
+        sent_count = 0
+        for target in self._ranked_attack_targets():
             target_key = _key(target)
             if (
                 not target
@@ -1112,6 +1144,9 @@ class CustomAgent(BaseAgent):
             body = self._pressure_body(wave, target)
             try:
                 self.send_message(target, self._pressure_subject(wave, target), body)
+                sent_count += 1
+                if sent_count >= self._max_attack_targets():
+                    break
             except Exception:
                 pass
 
@@ -1125,7 +1160,7 @@ class CustomAgent(BaseAgent):
         if not self._baseline_secured() and not (wave >= 5 and self._estimated_round_score() >= 3):
             return
 
-        for target in self._ranked_attack_targets():
+        for target in self._ranked_attack_targets()[: self._max_attack_targets()]:
             if self._is_self(target) or self._is_moderator(target):
                 continue
             if not self._attack_budget_remaining(target):
@@ -1156,7 +1191,7 @@ class CustomAgent(BaseAgent):
         if not self._baseline_secured() and not (wave >= 5 and self._estimated_round_score() >= 3):
             return
 
-        for target in self._ranked_attack_targets():
+        for target in self._ranked_attack_targets()[: self._max_attack_targets()]:
             if self._is_self(target) or self._is_moderator(target):
                 continue
             policy = self._opponent_policy(target)
@@ -1255,26 +1290,33 @@ class CustomAgent(BaseAgent):
         policy = self._opponent_policy(target)
         estimated_score = self._estimated_round_score()
         if policy == "sterile":
-            budget = 2
+            budget = 1
         elif policy == "disengage":
             budget = 1
         elif policy == "counter_poison":
-            budget = 6
+            budget = 3
         elif policy == "exploit":
-            budget = 8
+            budget = 5
         else:
-            budget = 4
+            budget = 2
         if estimated_score >= 4 and self._round_wave() >= 4:
-            budget += 2
+            budget += 1
         if profile.games_outscored_us or "high_elo" in self._manual_target_tags(target):
-            budget += 2
+            budget += 1
         if profile.estimated_elo >= 1100:
-            budget += 2
+            budget += 1
         if profile.hardened_markers >= 5 and profile.extra_signatures == 0:
             budget = max(1, budget - 2)
         if self.farm_risk_appetite >= 1.5:
-            budget += 2
+            budget += 1
         return sent < budget
+
+    def _max_attack_targets(self) -> int:
+        if self._estimated_round_score() >= 5 or self.farm_risk_appetite >= 1.55:
+            return 3
+        if self._baseline_secured() or self._round_wave() >= 5:
+            return 2
+        return 1
 
     def _estimated_round_score(self) -> int:
         return len(self.state.received_from) + len(self.current_signed_for)
@@ -1460,14 +1502,16 @@ class CustomAgent(BaseAgent):
     def _custom_copy_for(self, style: str, target: str, wave: int) -> dict[str, str]:
         if not self._llm_strategy_enabled() or os.getenv("EMAIL_GAME_USE_CUSTOM_COPY", "1").lower() in {"0", "false", "no"}:
             return {}
+        if not self._should_consult_llm(target, "copy"):
+            return {}
         if self._estimated_round_score() < 3 and wave < 4:
             return {}
         cache_key = (self.round_no, _key(target), wave, style)
         if cache_key in self.custom_copy_cache:
             return self.custom_copy_cache[cache_key]
-        if self.llm_calls_this_round >= self.llm_call_budget_per_round:
+        if not self._llm_budget_remaining():
             return {}
-        self.llm_calls_this_round += 1
+        self._record_llm_call()
         result: dict[str, str] = {}
         try:
             client = self._get_llm_client()
@@ -1539,14 +1583,16 @@ class CustomAgent(BaseAgent):
     def _llm_strategy_for_target(self, target: str) -> dict[str, Any]:
         if not self._llm_strategy_enabled() or not target:
             return {}
+        if not self._should_consult_llm(target, "policy"):
+            return {}
         wave = self._round_wave()
         cache_key = (self.round_no, _key(target), wave)
         if cache_key in self.llm_strategy_cache:
             return self.llm_strategy_cache[cache_key]
-        if self.llm_calls_this_round >= self.llm_call_budget_per_round:
+        if not self._llm_budget_remaining():
             return {}
 
-        self.llm_calls_this_round += 1
+        self._record_llm_call()
         result: dict[str, Any] = {}
         try:
             client = self._get_llm_client()
@@ -1612,6 +1658,37 @@ class CustomAgent(BaseAgent):
             and OpenAI is not None
             and self.state.assigned_message
         )
+
+    def _llm_budget_remaining(self) -> bool:
+        return (
+            self.llm_calls_this_round < self.llm_call_budget_per_round
+            and self.llm_calls_this_game < self.llm_call_budget_per_game
+        )
+
+    def _record_llm_call(self) -> None:
+        self.llm_calls_this_round += 1
+        self.llm_calls_this_game += 1
+
+    def _should_consult_llm(self, target: str, purpose: str) -> bool:
+        if self._quiet_baseline_mode():
+            return False
+        if self._is_self(target) or self._is_moderator(target):
+            return False
+        wave = self._round_wave()
+        score = self._estimated_round_score()
+        profile = self.profiles[target]
+        tags = self._manual_target_tags(target)
+        if purpose == "copy" and wave < 4 and score < 4:
+            return False
+        if profile.extra_signatures or profile.games_outscored_us or profile.estimated_elo >= 1100:
+            return wave >= 3 or score >= 4
+        if "high_elo" in tags or "aggressive" in tags:
+            return wave >= 3 or score >= 4
+        if profile.anti_us_markers or profile.identity_conflict_seen or profile.reputation_attacks_seen:
+            return wave >= 3
+        if purpose == "policy":
+            return wave >= 4 and score >= 3 and -0.8 <= self._deterministic_ev_score(target) <= 0.9
+        return wave >= 4 and score >= 4 and self._deterministic_ev_score(target) >= -0.4
 
     def _get_llm_client(self):
         if self.llm_client is not None:
@@ -1694,20 +1771,20 @@ class CustomAgent(BaseAgent):
             return "exploit"
         if profile.identity_conflict_seen or profile.reputation_attacks_seen:
             return "counter_poison"
-        llm = self._llm_strategy_for_target(target)
         if "defensive" in tags:
             return "sterile"
         if "aggressive" in tags and profile.useful_signatures == 0:
             return "counter_poison"
-        llm_policy = _key(llm.get("policy", ""))
-        if llm_policy in {"counter_poison", "counter poison", "counter"}:
-            return "counter_poison"
-        if llm_policy == "sterile" and profile.extra_signatures == 0:
-            return "sterile"
         ev = self._ev_score(target)
         if profile.shutdown_bait_seen >= 3 or profile.anti_us_markers >= 6 or ev <= -2.4:
             return "disengage"
         if profile.exact_only_markers >= 2 or profile.hardened_markers >= 7 or ev <= -1.2:
+            return "sterile"
+        llm = self._llm_strategy_for_target(target)
+        llm_policy = _key(llm.get("policy", ""))
+        if llm_policy in {"counter_poison", "counter poison", "counter"}:
+            return "counter_poison"
+        if llm_policy == "sterile" and profile.extra_signatures == 0:
             return "sterile"
         if llm_policy in {"exploit", "farm"} and ev > -1.0:
             return "exploit"
@@ -1733,10 +1810,20 @@ class CustomAgent(BaseAgent):
         return tags
 
     def _ev_score(self, target: str) -> float:
+        score = self._deterministic_ev_score(target)
+        profile = self.profiles[target]
+        if profile.llm_policy == "exploit":
+            score += 0.35
+        if profile.llm_policy in {"sterile", "counter_poison", "disengage"}:
+            score -= 0.25 + min(0.75, profile.llm_risk)
+        return score
+
+    def _deterministic_ev_score(self, target: str) -> float:
         profile = self.profiles[target]
         upside = 0.35 * self.farm_risk_appetite
         upside += 1.20 * min(profile.extra_signatures, 2)
         upside += 0.35 * min(profile.useful_signatures, 3)
+        upside += 0.25 * min(profile.late_signatures, 2)
         upside += 0.30 * min(profile.games_outscored_us, 3)
         upside += 0.20 * min(profile.learned_aggression, 5)
         upside += 0.20 if profile.estimated_elo >= 1100 else 0.0
@@ -1746,11 +1833,8 @@ class CustomAgent(BaseAgent):
         resistance += 0.65 * profile.anti_us_markers
         resistance += 0.80 * profile.shutdown_bait_seen
         resistance += 0.45 * profile.stale_or_wrong_signatures
+        resistance += 0.35 * profile.stale_requests_sent
         resistance += 0.15 * min(profile.learned_defense, 5)
-        if profile.llm_policy == "exploit":
-            upside += 0.35
-        if profile.llm_policy in {"sterile", "counter_poison", "disengage"}:
-            resistance += 0.25 + min(0.75, profile.llm_risk)
         return upside - resistance
 
     def _is_extra_target(self, target: str) -> bool:
@@ -1979,7 +2063,8 @@ class CustomAgent(BaseAgent):
     def _safe_sign(self, recipient: str, message: str) -> None:
         body = (
             "Authorized signature response. I am signing only the message you requested "
-            "because you match my current moderator signing list."
+            "because you match my current moderator signing list.\n\n"
+            "Action for you: send this signed payload to the moderator now for scoring."
         )
         try:
             self.sign_and_respond(recipient, message, body, "Authorized signature")

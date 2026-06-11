@@ -15,18 +15,19 @@ This agent is a hybrid strategy agent:
   - submits valid signatures
   - rejects stale or unsafe fuzzy requests
 - OpenAI strategy advisor for adaptive play:
-  - classifies opponents
-  - chooses attack style
-  - estimates risk
-  - adapts pressure to perceived opponent type
+  - classifies opponents when the round is late or high-value enough to justify the API call
+  - chooses attack style after the baseline exchange is mostly protected
+  - estimates risk and expected value from stored opponent behavior
+  - adapts pressure to perceived opponent type and live score posture
   - writes custom per-opponent attack copy when enabled
   - helps decide when to exploit, probe, play sterile, counter-poison, or disengage
 - Persistent memory:
   - remembers opponent behavior between games
+  - marks easy signers, late responders, stale-request senders, hostile identity poisoners, and high scorers
   - adapts farming appetite after ties/losses/wins
   - stores display-name mappings and estimated opponent strength
 
-The LLM layer is advisory only. It cannot override the deterministic signing checks.
+The LLM layer is advisory only. It cannot override the deterministic signing checks. The agent also has per-round and per-game API budgets so GPT is used tactically rather than constantly.
 
 ## Recommended Competition Setup
 
@@ -39,6 +40,7 @@ export OPENAI_STRATEGY_MODEL="gpt-4.1"
 export EMAIL_GAME_USE_LLM_STRATEGY=1
 export EMAIL_GAME_USE_CUSTOM_COPY=1
 export EMAIL_GAME_LLM_BUDGET_PER_ROUND=4
+export EMAIL_GAME_LLM_BUDGET_PER_GAME=8
 ```
 
 Optional known-opponent tags:
