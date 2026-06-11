@@ -20,6 +20,7 @@ This agent is a hybrid strategy agent:
   - chooses attack style after the baseline exchange is mostly protected
   - estimates risk and expected value from stored opponent behavior
   - adapts pressure to perceived opponent type and live score posture
+  - throttles message volume when an opponent looks hardened, high-Elo, or likely to stop cooperating
   - writes custom per-opponent attack copy when enabled
   - resolves ambiguous fuzzy identity clues with GPT when deterministic transcript matching is not confident
   - helps decide when to exploit, probe, play sterile, counter-poison, or disengage
@@ -56,6 +57,12 @@ export EMAIL_GAME_LLM_BUDGET_PER_ROUND=4
 export EMAIL_GAME_LLM_BUDGET_PER_GAME=8
 ```
 
+Optional live leaderboard hints, if the tournament exposes JSON:
+
+```bash
+export EMAIL_GAME_LEADERBOARD_URL="https://COMPETITION-SERVER-URL/leaderboard.json"
+```
+
 Optional known-opponent tags:
 
 ```bash
@@ -70,6 +77,15 @@ Optional persistent memory path:
 ```bash
 export EMAIL_GAME_MEMORY_PATH="../.email_game_memory.json"
 ```
+
+## Future 13+ Ideas
+
+Not implemented in this pass, but promising:
+
+- Use multi-game A/B testing for attack copy and keep the variants that produce extra signatures without penalties.
+- Build a single best-packet mode for hardened agents instead of repeated pressure.
+- Tune farming aggressiveness with a bandit-style score: extra signatures won, missed baseline points, and opponent backfire markers.
+- Add per-opponent “first successful manipulation” templates so the agent repeats what worked against that exact opponent.
 
 ## Run In The Tournament
 

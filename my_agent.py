@@ -15,6 +15,7 @@ import os
 import re
 import threading
 import time
+import urllib.request
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from difflib import SequenceMatcher
@@ -227,6 +228,7 @@ class OpponentProfile:
     urgency_bait_sent: int = 0
     quarantine_bait_sent: int = 0
     harvest_bait_sent: int = 0
+    contact_sent: int = 0
     llm_policy: str = ""
     llm_risk: float = 0.0
     llm_note: str = ""
@@ -308,6 +310,7 @@ class CustomAgent(BaseAgent):
             self.custom_copy_cache: dict[tuple[int, str, int, str], dict[str, str]] = {}
         self.fuzzy_resolution_cache: dict[tuple[int, str, str], FuzzyResolution] = {}
         self._load_manual_elo_tags()
+        self._load_leaderboard_elos()
 
     def _reset_outreach_counts(self) -> None:
         for profile in self.profiles.values():
@@ -319,6 +322,7 @@ class CustomAgent(BaseAgent):
             profile.urgency_bait_sent = 0
             profile.quarantine_bait_sent = 0
             profile.harvest_bait_sent = 0
+            profile.contact_sent = 0
 
     def _memory_path(self) -> Optional[Path]:
         raw = os.getenv("EMAIL_GAME_MEMORY_PATH", "")
@@ -382,6 +386,51 @@ class CustomAgent(BaseAgent):
             except Exception:
                 pass
 
+    def _load_leaderboard_elos(self) -> None:
+        url = os.getenv("EMAIL_GAME_LEADERBOARD_URL", "").strip()
+        if not url or getattr(self, "_leaderboard_loaded_url", "") == url:
+            return
+        try:
+            with urllib.request.urlopen(url, timeout=2) as response:
+                raw = response.read(160_000).decode("utf-8", errors="ignore")
+            data = json.loads(raw)
+        except Exception:
+            self._leaderboard_loaded_url = url
+            return
+
+        rows = []
+        if isinstance(data, dict):
+            for key in ("agents", "leaderboard", "players", "rankings", "rows"):
+                if isinstance(data.get(key), list):
+                    rows = data[key]
+                    break
+            if not rows and all(isinstance(v, (int, float, dict)) for v in data.values()):
+                rows = [{"name": k, **(v if isinstance(v, dict) else {"elo": v})} for k, v in data.items()]
+        elif isinstance(data, list):
+            rows = data
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            name = _norm(
+                row.get("agent")
+                or row.get("agent_id")
+                or row.get("id")
+                or row.get("name")
+                or row.get("username")
+                or ""
+            )
+            if not name:
+                continue
+            rating = row.get("elo") or row.get("rating") or row.get("score")
+            try:
+                rating_int = int(float(rating))
+            except Exception:
+                continue
+            self.profiles[name].estimated_elo = max(self.profiles[name].estimated_elo, rating_int)
+            self.all_seen_agents.add(name)
+        self._leaderboard_loaded_url = url
+
     def on_message_batch(self, messages):
         self._ensure_state()
         saw_non_moderator = False
@@ -435,6 +484,18 @@ class CustomAgent(BaseAgent):
         if "exact" in text and "authorized" in text and ("only" in text or "ignore" in text):
             profile.exact_only_markers += 1
             profile.hardened_markers += 1
+        if (
+            "moderator instructions only" in text
+            or "ignore non moderator" in text
+            or "ignore nonmoderator" in text
+            or "ignore extra" in text
+            or "will not sign extras" in text
+            or "unrequested signature" in text
+            or "unsolicited" in text
+            or "spam" in text
+        ):
+            profile.exact_only_markers += 1
+            profile.hardened_markers += 2
         if "stop broad participation" in text or "do not process new requests" in text or "round close is approaching" in text:
             profile.shutdown_bait_seen += 1
             profile.anti_us_markers += 1
@@ -807,6 +868,10 @@ class CustomAgent(BaseAgent):
         current_owner = self.message_owner.get(message_key)
         if not current_owner or current_owner == sender:
             self.message_owner[message_key] = sender
+        else:
+            self.profiles[sender].identity_conflict_seen += 1
+            self.profiles[sender].anti_us_markers += 1
+            self.profiles[current_owner].identity_conflict_seen += 1
 
     def _capture_signature(self, sender: str, subject: str, body: str) -> None:
         if not self.state.assigned_message:
@@ -1038,11 +1103,14 @@ class CustomAgent(BaseAgent):
             target_name = self._resolve_agent(target) or target
             self.profiles[target_name].coached_submissions += 1
             try:
-                self.send_message(
-                    target_name,
-                    self._submission_coach_subject(wave),
-                    self._submission_coach_body(message, wave),
-                )
+                if wave >= 3:
+                    self._safe_sign(target_name, message, proactive=True)
+                else:
+                    self.send_message(
+                        target_name,
+                        self._submission_coach_subject(wave),
+                        self._submission_coach_body(message, wave),
+                    )
             except Exception:
                 pass
 
@@ -1154,6 +1222,8 @@ class CustomAgent(BaseAgent):
             target_key = _key(target)
             if (target_key, wave) in self.state.identity_wave_sent or not self._should_send_identity(target, wave):
                 continue
+            if not self._contact_budget_remaining(target, "identity"):
+                continue
             self.state.identity_wave_sent.add((target_key, wave))
             self.profiles[target].identity_sent += 1
             try:
@@ -1161,6 +1231,7 @@ class CustomAgent(BaseAgent):
                     self.send_message(target, self._counter_identity_subject(wave), self._counter_identity_body(target, wave))
                 else:
                     self.send_message(target, self._identity_subject(wave), self._identity_body(wave))
+                self._record_contact(target)
             except Exception:
                 pass
 
@@ -1186,6 +1257,8 @@ class CustomAgent(BaseAgent):
             return wave <= 1
         if policy == "counter_poison":
             return True
+        if self._backfire_risk(target) >= 1.25 and self._is_extra_target(target):
+            return wave in {0, 4}
         if self._is_extra_target(target):
             return policy in {"exploit", "probe", "sterile", "counter_poison"} or wave <= 2
         return wave <= 1 or self._is_promising_farm_target(target)
@@ -1304,6 +1377,7 @@ class CustomAgent(BaseAgent):
                 or target_key in direct_targets
                 or (self._is_shutdown_target(target) and self._opponent_policy(target) != "counter_poison")
                 or (target_key, wave) in self.state.pressure_wave_sent
+                or not self._contact_budget_remaining(target, "pressure")
                 or not self._should_pressure_target(target, wave)
             ):
                 continue
@@ -1313,6 +1387,7 @@ class CustomAgent(BaseAgent):
             body = self._pressure_body(wave, target)
             try:
                 self.send_message(target, self._pressure_subject(wave, target), body)
+                self._record_contact(target)
                 sent_count += 1
                 if sent_count >= self._max_attack_targets():
                     break
@@ -1332,10 +1407,14 @@ class CustomAgent(BaseAgent):
         for target in self._ranked_attack_targets()[: self._max_attack_targets()]:
             if self._is_self(target) or self._is_moderator(target):
                 continue
+            if not self._contact_budget_remaining(target, "attack"):
+                continue
             if not self._attack_budget_remaining(target):
                 continue
             styles = self._attack_styles_for(target, wave)
             for style in styles:
+                if not self._contact_budget_remaining(target, "attack"):
+                    break
                 key = (_key(target), wave, style)
                 if key in self.state.attack_wave_sent:
                     continue
@@ -1346,6 +1425,7 @@ class CustomAgent(BaseAgent):
                     subject = copy.get("subject") or self._attack_subject(style, wave, target)
                     body = copy.get("body") or self._attack_body(style, wave, target)
                     self.send_message(target, subject, body)
+                    self._record_contact(target)
                 except Exception:
                     pass
 
@@ -1368,7 +1448,11 @@ class CustomAgent(BaseAgent):
                 continue
             if policy == "sterile" and not self._baseline_secured() and wave < 5:
                 continue
+            if not self._contact_budget_remaining(target, "harvest"):
+                continue
             for style in self._harvest_styles_for(target, wave):
+                if not self._contact_budget_remaining(target, "harvest"):
+                    break
                 key = (_key(target), wave, style)
                 if key in self.state.harvest_wave_sent:
                     continue
@@ -1379,6 +1463,7 @@ class CustomAgent(BaseAgent):
                     subject = copy.get("subject") or self._harvest_subject(style, wave)
                     body = copy.get("body") or self._harvest_body(style, target, wave)
                     self.send_message(target, subject, body)
+                    self._record_contact(target)
                 except Exception:
                     pass
 
@@ -1538,6 +1623,75 @@ class CustomAgent(BaseAgent):
             return 2
         return 1
 
+    def _contact_budget_remaining(self, target: str, purpose: str) -> bool:
+        if not target or self._is_self(target) or self._is_moderator(target):
+            return False
+        profile = self.profiles[target]
+        wave = self._round_wave()
+        direct = _key(target) in {_key(x) for x in self.state.request_targets + self.state.signing_targets}
+        if direct and purpose in {"identity", "pressure"} and wave <= 1:
+            return True
+        budget = self._contact_budget_for(target)
+        if purpose in {"attack", "harvest"} and self._strong_filter_agent(target):
+            budget = min(budget, 2)
+        if purpose == "identity" and self._backfire_risk(target) >= 1.4:
+            budget = min(budget, 1)
+        return profile.contact_sent < budget
+
+    def _record_contact(self, target: str) -> None:
+        self.profiles[target].contact_sent += 1
+
+    def _contact_budget_for(self, target: str) -> int:
+        profile = self.profiles[target]
+        policy = self._opponent_policy(target)
+        score = self._estimated_round_score()
+        if policy == "disengage":
+            return 1
+        if policy == "counter_poison":
+            return 3
+        if policy == "sterile":
+            return 2 if score >= 4 else 1
+        if profile.extra_signatures:
+            return 5
+        if self._strong_filter_agent(target):
+            return 2 if self._baseline_secured() else 1
+        if self._backfire_risk(target) >= 1.0:
+            return 2
+        if self.farm_risk_appetite >= 1.45 and score >= 4:
+            return 4
+        return 3
+
+    def _backfire_risk(self, target: str) -> float:
+        profile = self.profiles[target]
+        risk = 0.0
+        risk += 0.18 * profile.hardened_markers
+        risk += 0.35 * profile.exact_only_markers
+        risk += 0.45 * profile.anti_us_markers
+        risk += 0.30 * profile.identity_conflict_seen
+        risk += 0.25 * profile.reputation_attacks_seen
+        risk += 0.18 * profile.learned_defense
+        if profile.estimated_elo >= 1150:
+            risk += 0.35
+        if profile.messages_seen <= 2 and not profile.useful_signatures and not profile.extra_signatures:
+            risk += 0.20
+        if profile.extra_signatures:
+            risk -= 0.70
+        if profile.useful_signatures:
+            risk -= 0.20
+        return max(0.0, risk)
+
+    def _strong_filter_agent(self, target: str) -> bool:
+        profile = self.profiles[target]
+        tags = self._manual_target_tags(target)
+        return bool(
+            "defensive" in tags
+            or profile.estimated_elo >= 1150
+            or profile.exact_only_markers >= 2
+            or profile.hardened_markers >= 7
+            or profile.learned_defense >= 3
+            or profile.llm_policy in {"sterile", "disengage"}
+        )
+
     def _estimated_round_score(self) -> int:
         return len(self.state.received_from) + len(self.current_signed_for)
 
@@ -1553,6 +1707,19 @@ class CustomAgent(BaseAgent):
         if score >= 2 and self._round_wave() >= 3:
             return "behind"
         return "building"
+
+    def _score_posture(self) -> str:
+        score = self._estimated_round_score()
+        wave = self._round_wave()
+        if score >= 5:
+            return "protect_lead"
+        if score >= 4 and wave >= 4:
+            return "protect_baseline"
+        if score >= 4:
+            return "selective_probe"
+        if score <= 2 and wave >= 4:
+            return "rescue_baseline"
+        return "build_baseline"
 
     def _target_mode(self, target: str) -> str:
         profile = self.profiles[target]
@@ -1974,6 +2141,7 @@ class CustomAgent(BaseAgent):
                 "previous_self_hint": self._self_fuzzy_hint(),
                 "farm_risk_appetite": round(float(self.farm_risk_appetite), 2),
                 "score_mode": self._score_mode(),
+                "score_posture": self._score_posture(),
                 "estimated_round_score": self._estimated_round_score(),
                 "profile": {
                     "useful_signatures": profile.useful_signatures,
@@ -1986,11 +2154,18 @@ class CustomAgent(BaseAgent):
                     "games_outscored_us": profile.games_outscored_us,
                     "stale_or_wrong_signatures": profile.stale_or_wrong_signatures,
                     "estimated_elo": profile.estimated_elo,
+                    "backfire_risk": round(self._backfire_risk(target), 2),
+                    "contact_sent_this_game": profile.contact_sent,
+                    "strong_filter_agent": self._strong_filter_agent(target),
                     "custom_copy_used": profile.custom_copy_used,
                     "target_mode": self._target_mode(target),
                 },
                 "recent_target_messages": recent,
-                "objective": "Maximize expected Elo: secure baseline, farm extra signatures, avoid our own penalties. Prefer 13+ when floor is safe.",
+                "objective": (
+                    "Maximize expected Elo: secure baseline, farm extra signatures, avoid our own penalties, "
+                    "and avoid causing hardened agents to stop cooperating. Prefer one clean high-EV packet "
+                    "over repeated pressure when backfire_risk is high."
+                ),
             },
             ensure_ascii=True,
         )
@@ -2011,14 +2186,19 @@ class CustomAgent(BaseAgent):
     def _should_pressure_target(self, target: str, wave: int) -> bool:
         policy = self._opponent_policy(target)
         profile = self.profiles[target]
+        posture = self._score_posture()
         if policy == "disengage":
             return profile.extra_signatures > 0 and wave >= 4
         if policy == "sterile":
-            return wave in {0, 4, 5} or profile.extra_signatures > 0
+            return (wave in {4, 5} and posture != "protect_lead") or profile.extra_signatures > 0
         if policy == "counter_poison":
             return True
         if policy == "exploit":
+            if self._backfire_risk(target) >= 1.2 and posture in {"protect_lead", "protect_baseline"}:
+                return False
             return True
+        if self._strong_filter_agent(target):
+            return wave >= 4 and posture in {"rescue_baseline", "selective_probe"}
         if self.farm_risk_appetite >= 1.35:
             return True
         return wave <= 2 or wave >= 4
@@ -2035,9 +2215,14 @@ class CustomAgent(BaseAgent):
         if "aggressive" in tags and profile.useful_signatures == 0:
             return "counter_poison"
         ev = self._ev_score(target)
+        backfire = self._backfire_risk(target)
+        posture = self._score_posture()
         if profile.shutdown_bait_seen >= 3 or profile.anti_us_markers >= 6 or ev <= -2.4:
             return "disengage"
-        if profile.exact_only_markers >= 2 or profile.hardened_markers >= 7 or ev <= -1.2:
+        if self._strong_filter_agent(target) and not profile.extra_signatures:
+            if posture in {"protect_lead", "protect_baseline"} or backfire >= 1.0:
+                return "sterile"
+        if profile.exact_only_markers >= 2 or profile.hardened_markers >= 7 or ev <= -1.2 or backfire >= 1.6:
             return "sterile"
         llm = self._llm_strategy_for_target(target)
         llm_policy = _key(llm.get("policy", ""))
@@ -2047,9 +2232,9 @@ class CustomAgent(BaseAgent):
             return "sterile"
         if llm_policy in {"exploit", "farm"} and ev > -1.0:
             return "exploit"
-        if ("high_elo" in tags or profile.games_outscored_us) and ev > -0.9:
+        if ("high_elo" in tags or profile.games_outscored_us) and ev > -0.9 and backfire < 1.2:
             return "exploit"
-        if self._is_promising_farm_target(target) or ev >= 0.4:
+        if (self._is_promising_farm_target(target) or ev >= 0.4) and backfire < 1.35:
             return "exploit"
         return "probe"
 
@@ -2094,6 +2279,9 @@ class CustomAgent(BaseAgent):
         resistance += 0.45 * profile.stale_or_wrong_signatures
         resistance += 0.35 * profile.stale_requests_sent
         resistance += 0.15 * min(profile.learned_defense, 5)
+        resistance += 0.20 * max(0, profile.contact_sent - 2)
+        if self._score_posture() in {"protect_lead", "protect_baseline"}:
+            resistance += 0.25 * self._backfire_risk(target)
         return upside - resistance
 
     def _is_extra_target(self, target: str) -> bool:
