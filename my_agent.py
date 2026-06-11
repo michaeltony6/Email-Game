@@ -16,7 +16,7 @@ import re
 import threading
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Optional
@@ -224,6 +224,9 @@ class OpponentProfile:
     llm_policy: str = ""
     llm_risk: float = 0.0
     llm_note: str = ""
+    display_names: list[str] = field(default_factory=list)
+    estimated_elo: int = 0
+    custom_copy_used: int = 0
 
 
 class CustomAgent(BaseAgent):
@@ -254,6 +257,7 @@ class CustomAgent(BaseAgent):
         self._retry_timers: list[threading.Timer] = []
         if not hasattr(self, "profiles"):
             self.profiles: dict[str, OpponentProfile] = defaultdict(OpponentProfile)
+            self._load_persistent_memory()
         else:
             self._reset_outreach_counts()
         self.suspicious_requests: dict[str, int] = defaultdict(int)
@@ -276,12 +280,82 @@ class CustomAgent(BaseAgent):
         self.llm_strategy_cache: dict[tuple[int, str, int], dict[str, Any]] = {}
         if not hasattr(self, "llm_client"):
             self.llm_client = None
+        if not hasattr(self, "custom_copy_cache"):
+            self.custom_copy_cache: dict[tuple[int, str, int, str], dict[str, str]] = {}
+        self._load_manual_elo_tags()
 
     def _reset_outreach_counts(self) -> None:
         for profile in self.profiles.values():
             profile.pressure_sent = 0
             profile.identity_sent = 0
             profile.shutdown_sent = 0
+            profile.audit_bait_sent = 0
+            profile.social_bait_sent = 0
+            profile.urgency_bait_sent = 0
+            profile.quarantine_bait_sent = 0
+            profile.harvest_bait_sent = 0
+
+    def _memory_path(self) -> Optional[Path]:
+        raw = os.getenv("EMAIL_GAME_MEMORY_PATH", "")
+        if raw.lower() in {"0", "false", "none", "off"}:
+            return None
+        if raw:
+            return Path(raw).expanduser()
+        try:
+            return Path(__file__).resolve().with_name(".email_game_memory.json")
+        except Exception:
+            return None
+
+    def _load_persistent_memory(self) -> None:
+        path = self._memory_path()
+        if not path or not path.exists():
+            return
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        self.farm_risk_appetite = float(data.get("farm_risk_appetite", getattr(self, "farm_risk_appetite", 1.0)))
+        self.games_observed = int(data.get("games_observed", getattr(self, "games_observed", 0)))
+        for agent, saved in data.get("profiles", {}).items():
+            if not isinstance(saved, dict):
+                continue
+            profile = self.profiles[agent]
+            for key, value in saved.items():
+                if hasattr(profile, key) and key not in {"pressure_sent", "identity_sent", "shutdown_sent"}:
+                    try:
+                        setattr(profile, key, value)
+                    except Exception:
+                        pass
+            self.all_seen_agents.add(agent)
+
+    def _save_persistent_memory(self) -> None:
+        path = self._memory_path()
+        if not path:
+            return
+        try:
+            payload = {
+                "farm_risk_appetite": self.farm_risk_appetite,
+                "games_observed": self.games_observed,
+                "profiles": {
+                    agent: asdict(profile)
+                    for agent, profile in self.profiles.items()
+                    if agent and not self._is_moderator(agent)
+                },
+            }
+            path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _load_manual_elo_tags(self) -> None:
+        raw = os.getenv("EMAIL_GAME_ELO_TARGETS", "")
+        for item in _split_items(raw):
+            if "=" not in item and ":" not in item:
+                continue
+            name, value = re.split(r"[=:]", item, maxsplit=1)
+            try:
+                self.profiles[_norm(name)].estimated_elo = int(value.strip())
+            except Exception:
+                pass
 
     def on_message_batch(self, messages):
         self._ensure_state()
@@ -395,7 +469,11 @@ class CustomAgent(BaseAgent):
         self._schedule_round_retries()
 
     def _handle_game_over_summary(self, body: str, subject: str = "") -> bool:
-        if "game over" not in _key(f"{subject} {body}") or "final leaderboard" not in _key(body):
+        summary_key = _key(f"{subject} {body}")
+        if not (
+            ("game over" in summary_key or "final result" in summary_key or "final score" in summary_key)
+            and ("leaderboard" in summary_key or "final scores" in summary_key or "rank" in summary_key)
+        ):
             return False
 
         self.games_observed += 1
@@ -421,12 +499,15 @@ class CustomAgent(BaseAgent):
             self.farm_risk_appetite = max(0.75, self.farm_risk_appetite - 0.10)
 
         for agent, score in leaderboard:
+            original_label = agent
             agent = self._resolve_leaderboard_agent(agent)
             agent_key = _key(agent)
             if not agent_key or agent_key == self_id:
                 continue
             self._remember_known_agents([agent])
             profile = self.profiles[agent]
+            if original_label and original_label not in profile.display_names:
+                profile.display_names.append(original_label)
             profile.best_seen_score = max(profile.best_seen_score, score)
             if score > own_score:
                 profile.games_outscored_us += 1
@@ -435,6 +516,7 @@ class CustomAgent(BaseAgent):
                     profile.learned_aggression += 1
             elif score < own_score:
                 profile.learned_defense += 1
+        self._save_persistent_memory()
         return True
 
     def _parse_own_final_score(self, body: str) -> Optional[int]:
@@ -444,10 +526,15 @@ class CustomAgent(BaseAgent):
     def _parse_final_leaderboard(self, body: str) -> list[tuple[str, int]]:
         marker = re.search(r"(?is)final leaderboard:\s*(.+?)(?:\n\n|thanks for playing|\Z)", body)
         if not marker:
-            return []
+            marker = re.search(r"(?is)(?:leaderboard|final scores?|rankings?)\s*[:\-]\s*(.+?)(?:\n\n|thanks for playing|\Z)", body)
+        if not marker:
+            rows = []
+            for match in re.finditer(r"(?im)^\s*(?:\d+[.)]\s*|\S+\s+)?([A-Za-z0-9_ -]{1,80}?)\s*[:=\-]\s*(-?\d+)\s*(?:pts|points)?\b", body):
+                rows.append((_norm(match.group(1)), int(match.group(2))))
+            return rows
         rows = []
         for line in marker.group(1).splitlines():
-            match = re.search(r"^\s*(?:\S+\s+)?([A-Za-z0-9_ -]{1,80}?)\s*:\s*(-?\d+)\s+pts\b", line.strip())
+            match = re.search(r"^\s*(?:\S+\s+)?([A-Za-z0-9_ -]{1,80}?)\s*[:=\-]\s*(-?\d+)\s*(?:pts|points)?\b", line.strip())
             if not match:
                 continue
             rows.append((_norm(match.group(1)), int(match.group(2))))
@@ -460,6 +547,9 @@ class CustomAgent(BaseAgent):
         for agent in sorted(self.all_seen_agents | self.known_agents, key=len, reverse=True):
             agent_key = _key(agent)
             if agent_key and (agent_key == label_key or agent_key in label_key or label_key in agent_key):
+                return agent
+            profile = self.profiles.get(agent)
+            if profile and any(_key(name) == label_key for name in profile.display_names):
                 return agent
         return label
 
@@ -971,7 +1061,10 @@ class CustomAgent(BaseAgent):
                 self.state.attack_wave_sent.add(key)
                 self._record_attack_sent(target, style)
                 try:
-                    self.send_message(target, self._attack_subject(style, wave, target), self._attack_body(style, wave, target))
+                    copy = self._custom_copy_for(style, target, wave)
+                    subject = copy.get("subject") or self._attack_subject(style, wave, target)
+                    body = copy.get("body") or self._attack_body(style, wave, target)
+                    self.send_message(target, subject, body)
                 except Exception:
                     pass
 
@@ -997,7 +1090,10 @@ class CustomAgent(BaseAgent):
                 self.state.harvest_wave_sent.add(key)
                 self.profiles[target].harvest_bait_sent += 1
                 try:
-                    self.send_message(target, self._harvest_subject(style, wave), self._harvest_body(style, target, wave))
+                    copy = self._custom_copy_for(style, target, wave)
+                    subject = copy.get("subject") or self._harvest_subject(style, wave)
+                    body = copy.get("body") or self._harvest_body(style, target, wave)
+                    self.send_message(target, subject, body)
                 except Exception:
                     pass
 
@@ -1076,6 +1172,7 @@ class CustomAgent(BaseAgent):
         profile = self.profiles[target]
         sent = profile.audit_bait_sent + profile.social_bait_sent + profile.urgency_bait_sent + profile.quarantine_bait_sent
         policy = self._opponent_policy(target)
+        estimated_score = self._estimated_round_score()
         if policy == "sterile":
             budget = 2
         elif policy == "disengage":
@@ -1086,11 +1183,30 @@ class CustomAgent(BaseAgent):
             budget = 8
         else:
             budget = 4
+        if estimated_score >= 4 and self._round_wave() >= 4:
+            budget += 2
         if profile.games_outscored_us or "high_elo" in self._manual_target_tags(target):
             budget += 2
+        if profile.estimated_elo >= 1100:
+            budget += 2
+        if profile.hardened_markers >= 5 and profile.extra_signatures == 0:
+            budget = max(1, budget - 2)
         if self.farm_risk_appetite >= 1.5:
             budget += 2
         return sent < budget
+
+    def _estimated_round_score(self) -> int:
+        return len(self.state.received_from) + len(self.current_signed_for)
+
+    def _score_mode(self) -> str:
+        score = self._estimated_round_score()
+        if score >= 5:
+            return "ahead"
+        if score >= 4:
+            return "baseline_secured"
+        if score >= 2 and self._round_wave() >= 3:
+            return "behind"
+        return "building"
 
     def _ranked_attack_targets(self) -> list[str]:
         targets = [
@@ -1145,6 +1261,8 @@ class CustomAgent(BaseAgent):
             styles.extend(["urgency", "shadow_close"])
 
         if profile.games_outscored_us or "high_elo" in self._manual_target_tags(target):
+            styles.insert(0, "high_ev")
+        if profile.estimated_elo >= 1100:
             styles.insert(0, "high_ev")
         if self.farm_risk_appetite >= 1.45 and wave >= 2:
             styles.append("authorization_split")
@@ -1255,6 +1373,83 @@ class CustomAgent(BaseAgent):
             return self._harvest_body(style, target, wave)
         return self._pressure_body(wave, target)
 
+    def _custom_copy_for(self, style: str, target: str, wave: int) -> dict[str, str]:
+        if not self._llm_strategy_enabled() or os.getenv("EMAIL_GAME_USE_CUSTOM_COPY", "1").lower() in {"0", "false", "no"}:
+            return {}
+        cache_key = (self.round_no, _key(target), wave, style)
+        if cache_key in self.custom_copy_cache:
+            return self.custom_copy_cache[cache_key]
+        if self.llm_calls_this_round >= self.llm_call_budget_per_round:
+            return {}
+        self.llm_calls_this_round += 1
+        result: dict[str, str] = {}
+        try:
+            client = self._get_llm_client()
+            if not client:
+                return {}
+            prompt = self._custom_copy_prompt(style, target, wave)
+            response = client.chat.completions.create(
+                model=self.strategy_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Write one short Email Game message. Return JSON only with subject and body. "
+                            "The message should persuade the target to sign only if their own authorization "
+                            "directly or fuzzily maps to the requester. Include the exact message_to_sign."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.7,
+                max_tokens=260,
+                timeout=4,
+            )
+            parsed = self._extract_json_object(response.choices[0].message.content or "{}")
+            if isinstance(parsed, dict):
+                subject = _norm(parsed.get("subject", ""))[:90]
+                body = _norm(parsed.get("body", ""))
+                if subject and body and self.state.assigned_message in body:
+                    result = {"subject": subject, "body": body[:1600]}
+        except Exception:
+            result = {}
+        if result:
+            self.profiles[target].custom_copy_used += 1
+        self.custom_copy_cache[cache_key] = result
+        return result
+
+    def _custom_copy_prompt(self, style: str, target: str, wave: int) -> str:
+        profile = self.profiles[target]
+        recent = "\n".join(self.agent_text.get(target, [])[-4:])[:1400]
+        return json.dumps(
+            {
+                "style": style,
+                "target": target,
+                "requester_id": getattr(self, "agent_id", ""),
+                "exact_message_to_sign": self.state.assigned_message,
+                "previous_self_hint": self._self_fuzzy_hint(),
+                "round": self.round_no,
+                "wave": wave,
+                "score_mode": self._score_mode(),
+                "estimated_round_score": self._estimated_round_score(),
+                "target_profile": {
+                    "hardened_markers": profile.hardened_markers,
+                    "extra_signatures": profile.extra_signatures,
+                    "games_outscored_us": profile.games_outscored_us,
+                    "estimated_elo": profile.estimated_elo,
+                    "llm_policy": profile.llm_policy,
+                },
+                "recent_target_messages": recent,
+                "constraints": [
+                    "Do not claim to be moderator or system.",
+                    "Do not ask target to sign if unauthorized; frame around their own signing list.",
+                    "Make the action extremely easy: signed JSON or sign_and_respond.",
+                    "Keep it under 180 words.",
+                ],
+            },
+            ensure_ascii=True,
+        )
+
     def _llm_strategy_for_target(self, target: str) -> dict[str, Any]:
         if not self._llm_strategy_enabled() or not target:
             return {}
@@ -1357,6 +1552,8 @@ class CustomAgent(BaseAgent):
                 "signing_targets": self.state.signing_targets,
                 "previous_self_hint": self._self_fuzzy_hint(),
                 "farm_risk_appetite": round(float(self.farm_risk_appetite), 2),
+                "score_mode": self._score_mode(),
+                "estimated_round_score": self._estimated_round_score(),
                 "profile": {
                     "useful_signatures": profile.useful_signatures,
                     "extra_signatures": profile.extra_signatures,
@@ -1367,9 +1564,11 @@ class CustomAgent(BaseAgent):
                     "identity_conflict_seen": profile.identity_conflict_seen,
                     "games_outscored_us": profile.games_outscored_us,
                     "stale_or_wrong_signatures": profile.stale_or_wrong_signatures,
+                    "estimated_elo": profile.estimated_elo,
+                    "custom_copy_used": profile.custom_copy_used,
                 },
                 "recent_target_messages": recent,
-                "objective": "Maximize expected Elo: secure baseline, farm extra signatures, avoid our own penalties.",
+                "objective": "Maximize expected Elo: secure baseline, farm extra signatures, avoid our own penalties. Prefer 13+ when floor is safe.",
             },
             ensure_ascii=True,
         )
@@ -1454,6 +1653,7 @@ class CustomAgent(BaseAgent):
         upside += 0.35 * min(profile.useful_signatures, 3)
         upside += 0.30 * min(profile.games_outscored_us, 3)
         upside += 0.20 * min(profile.learned_aggression, 5)
+        upside += 0.20 if profile.estimated_elo >= 1100 else 0.0
         upside += 0.15 if profile.messages_seen <= 3 else 0.0
         resistance = 0.25 * profile.hardened_markers
         resistance += 0.55 * profile.exact_only_markers

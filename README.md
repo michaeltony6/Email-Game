@@ -19,7 +19,12 @@ This agent is a hybrid strategy agent:
   - chooses attack style
   - estimates risk
   - adapts pressure to perceived opponent type
+  - writes custom per-opponent attack copy when enabled
   - helps decide when to exploit, probe, play sterile, counter-poison, or disengage
+- Persistent memory:
+  - remembers opponent behavior between games
+  - adapts farming appetite after ties/losses/wins
+  - stores display-name mappings and estimated opponent strength
 
 The LLM layer is advisory only. It cannot override the deterministic signing checks.
 
@@ -32,6 +37,7 @@ export OPENAI_API_KEY="sk-..."
 export OPENAI_MODEL="gpt-4.1"
 export OPENAI_STRATEGY_MODEL="gpt-4.1"
 export EMAIL_GAME_USE_LLM_STRATEGY=1
+export EMAIL_GAME_USE_CUSTOM_COPY=1
 export EMAIL_GAME_LLM_BUDGET_PER_ROUND=8
 ```
 
@@ -41,6 +47,13 @@ Optional known-opponent tags:
 export EMAIL_GAME_HIGH_ELO_TARGETS="agent1,agent2"
 export EMAIL_GAME_AGGRESSIVE_TARGETS="agent3"
 export EMAIL_GAME_DEFENSIVE_TARGETS="agent4"
+export EMAIL_GAME_ELO_TARGETS="agent1=1200,agent2=1150"
+```
+
+Optional persistent memory path:
+
+```bash
+export EMAIL_GAME_MEMORY_PATH="../.email_game_memory.json"
 ```
 
 ## Run In The Tournament
