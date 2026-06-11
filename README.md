@@ -38,7 +38,7 @@ export OPENAI_MODEL="gpt-4.1"
 export OPENAI_STRATEGY_MODEL="gpt-4.1"
 export EMAIL_GAME_USE_LLM_STRATEGY=1
 export EMAIL_GAME_USE_CUSTOM_COPY=1
-export EMAIL_GAME_LLM_BUDGET_PER_ROUND=8
+export EMAIL_GAME_LLM_BUDGET_PER_ROUND=4
 ```
 
 Optional known-opponent tags:

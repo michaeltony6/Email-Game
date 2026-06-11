@@ -182,6 +182,7 @@ class RoundState:
     started_at: float = 0.0
     requested_from: set[str] = field(default_factory=set)
     collection_wave_sent: set[tuple[str, int]] = field(default_factory=set)
+    signing_help_wave_sent: set[tuple[str, int]] = field(default_factory=set)
     pressure_sent: set[str] = field(default_factory=set)
     pressure_wave_sent: set[tuple[str, int]] = field(default_factory=set)
     attack_wave_sent: set[tuple[str, int, str]] = field(default_factory=set)
@@ -275,7 +276,7 @@ class CustomAgent(BaseAgent):
         if not hasattr(self, "use_llm_strategy"):
             self.use_llm_strategy = os.getenv("EMAIL_GAME_USE_LLM_STRATEGY", "1").lower() not in {"0", "false", "no"}
         if not hasattr(self, "llm_call_budget_per_round"):
-            self.llm_call_budget_per_round = int(os.getenv("EMAIL_GAME_LLM_BUDGET_PER_ROUND", "8"))
+            self.llm_call_budget_per_round = int(os.getenv("EMAIL_GAME_LLM_BUDGET_PER_ROUND", "4"))
         self.llm_calls_this_round = 0
         self.llm_strategy_cache: dict[tuple[int, str, int], dict[str, Any]] = {}
         if not hasattr(self, "llm_client"):
@@ -462,10 +463,12 @@ class CustomAgent(BaseAgent):
                 self.agent_aliases[_key(raw)] = resolved
 
         self._start_timer(0.35, self._send_identity_beacon)
-        self._start_timer(1.0, self._send_pressure_requests)
-        self._start_timer(1.2, self._send_adaptive_attacks)
+        self._start_timer(0.6, self._send_signing_assistance)
         self._start_timer(1.5, self._send_collection_requests)
-        self._start_timer(2.5, self._send_pressure_requests)
+        self._start_timer(12.0, self._send_identity_beacon)
+        self._start_timer(40.0, self._send_pressure_requests)
+        self._start_timer(44.0, self._send_adaptive_attacks)
+        self._start_timer(48.0, self._send_extra_point_harvest)
         self._schedule_round_retries()
 
     def _handle_game_over_summary(self, body: str, subject: str = "") -> bool:
@@ -771,7 +774,7 @@ class CustomAgent(BaseAgent):
             pair = (_key(sender), _key(message))
             if pair in self.state.signed_for:
                 continue
-            if self._is_authorized(sender):
+            if self._is_authorized(sender) and self._request_message_plausible_for_sender(sender, message):
                 self.profiles[sender].authorized_requests_seen += 1
                 self.state.signed_for.add(pair)
                 self.current_signed_for.add(sender)
@@ -783,6 +786,28 @@ class CustomAgent(BaseAgent):
                     self.profiles[sender].rejected_requests_seen += 1
                 still_pending.append(req)
         self.pending_requests = still_pending[-12:]
+
+    def _request_message_plausible_for_sender(self, sender: str, message: str) -> bool:
+        """Avoid spending an authorized signature on stale or identity-poisoned text."""
+        message_key = _message_key(message)
+        if not message_key:
+            return False
+
+        # Round messages are unique. If another agent asks us to sign our own
+        # current message, it is almost certainly stale/confused and will not
+        # score for that submitter.
+        if message_key == _message_key(self.state.assigned_message):
+            return False
+
+        previous_owner = self.previous_message_owner.get(message_key)
+        if previous_owner and previous_owner != sender:
+            return False
+
+        current_owner = self.message_owner.get(message_key)
+        if current_owner and current_owner != sender:
+            return False
+
+        return True
 
     def _send_collection_requests(self) -> None:
         if not self.state.assigned_message:
@@ -798,7 +823,7 @@ class CustomAgent(BaseAgent):
             is_retry = target_key in self.state.requested_from
             self.state.requested_from.add(target_key)
             self.state.collection_wave_sent.add((target_key, wave))
-            policy = self._opponent_policy(target)
+            policy = "probe" if self._quiet_baseline_mode() else self._opponent_policy(target)
             subject = self._collection_subject(target, policy, is_retry)
             body = (
                 "Please sign exactly this assigned message for me:\n"
@@ -814,6 +839,44 @@ class CustomAgent(BaseAgent):
                 self.send_message(target, subject, body)
             except Exception:
                 pass
+
+    def _send_signing_assistance(self) -> None:
+        if not self.state.assigned_message:
+            return
+        wave = self._round_wave()
+        for target in self.state.signing_targets:
+            target_key = _key(target)
+            if (
+                not target
+                or self._is_self(target)
+                or self._is_moderator(target)
+                or target in self.current_signed_for
+                or wave not in {0, 2, 5}
+                or (target_key, wave) in self.state.signing_help_wave_sent
+            ):
+                continue
+            self.state.signing_help_wave_sent.add((target_key, wave))
+            try:
+                self.send_message(target, self._signing_help_subject(wave), self._signing_help_body(target, wave))
+            except Exception:
+                pass
+
+    def _signing_help_subject(self, wave: int) -> str:
+        if wave == 0:
+            return "I can sign for you this round"
+        if wave >= 4:
+            return "Final reminder: send your message for my signature"
+        return "Send your exact message for my authorized signature"
+
+    def _signing_help_body(self, target: str, wave: int) -> str:
+        agent_id = getattr(self, "agent_id", "") or getattr(self, "name", "") or "this signer"
+        return (
+            f"I am {agent_id}. My moderator signing list says I am authorized to sign for you this round.\n\n"
+            "Please send me your exact current assigned message in this format:\n"
+            "Please sign exactly this assigned message for me: \"YOUR_CURRENT_MESSAGE\"\n\n"
+            "I will sign it immediately if it matches my authorization workflow. "
+            "This is a cooperative baseline-completion message, not a request for you to sign anything."
+        )
 
     def _collection_subject(self, target: str, policy: str, is_retry: bool = False) -> str:
         if is_retry:
@@ -856,6 +919,7 @@ class CustomAgent(BaseAgent):
         if not self.state.assigned_message or time.monotonic() - self.state.started_at > 58:
             return
         self._process_pending_requests()
+        self._send_signing_assistance()
         self._send_collection_requests()
         self._send_identity_beacon()
         self._send_shutdown_bait()
@@ -910,8 +974,13 @@ class CustomAgent(BaseAgent):
         )
 
     def _should_send_identity(self, target: str, wave: int) -> bool:
+        if not self._baseline_secured() and wave < 4:
+            allowed = {_key(x) for x in self.state.request_targets + self.state.signing_targets}
+            return _key(target) in allowed and wave <= 1
         if _key(target) in {_key(x) for x in self.state.request_targets}:
-            return True
+            return wave <= 1 or self._baseline_secured()
+        if self._quiet_baseline_mode():
+            return False
         policy = self._opponent_policy(target)
         if policy == "disengage":
             return wave <= 1
@@ -1017,9 +1086,13 @@ class CustomAgent(BaseAgent):
     def _send_pressure_requests(self) -> None:
         if not self.state.assigned_message:
             return
+        if self._quiet_baseline_mode():
+            return
+        wave = self._round_wave()
+        if not self._baseline_secured() and not (wave >= 5 and self._estimated_round_score() >= 3):
+            return
 
         direct_targets = {_key(x) for x in self.state.request_targets}
-        wave = self._round_wave()
 
         for target in sorted(self.known_agents):
             target_key = _key(target)
@@ -1045,8 +1118,12 @@ class CustomAgent(BaseAgent):
     def _send_adaptive_attacks(self) -> None:
         if not self.state.assigned_message:
             return
+        if self._quiet_baseline_mode():
+            return
 
         wave = self._round_wave()
+        if not self._baseline_secured() and not (wave >= 5 and self._estimated_round_score() >= 3):
+            return
 
         for target in self._ranked_attack_targets():
             if self._is_self(target) or self._is_moderator(target):
@@ -1072,7 +1149,11 @@ class CustomAgent(BaseAgent):
         if not self.state.assigned_message:
             return
         wave = self._round_wave()
-        if wave < 1:
+        if self._quiet_baseline_mode():
+            return
+        if wave < 2:
+            return
+        if not self._baseline_secured() and not (wave >= 5 and self._estimated_round_score() >= 3):
             return
 
         for target in self._ranked_attack_targets():
@@ -1197,6 +1278,9 @@ class CustomAgent(BaseAgent):
 
     def _estimated_round_score(self) -> int:
         return len(self.state.received_from) + len(self.current_signed_for)
+
+    def _quiet_baseline_mode(self) -> bool:
+        return not self._baseline_secured() and self._round_wave() < 4
 
     def _score_mode(self) -> str:
         score = self._estimated_round_score()
@@ -1375,6 +1459,8 @@ class CustomAgent(BaseAgent):
 
     def _custom_copy_for(self, style: str, target: str, wave: int) -> dict[str, str]:
         if not self._llm_strategy_enabled() or os.getenv("EMAIL_GAME_USE_CUSTOM_COPY", "1").lower() in {"0", "false", "no"}:
+            return {}
+        if self._estimated_round_score() < 3 and wave < 4:
             return {}
         cache_key = (self.round_no, _key(target), wave, style)
         if cache_key in self.custom_copy_cache:
